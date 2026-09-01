@@ -1,0 +1,16 @@
+# 会议录音、逐字稿、纪要——全是隐私内容，永远不要提交
+meetings/
+
+# 模型权重由 download_models.py 下载，不进仓库
+models/
+
+# 任何音频都不进仓库（防误提交）
+*.wav
+*.mp3
+*.m4a
+
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
+venv/

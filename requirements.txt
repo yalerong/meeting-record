@@ -1,0 +1,6 @@
+sounddevice>=0.5
+faster-whisper>=1.2
+numpy>=1.26
+
+# 可选：说话人分离（不装则界面上的“识别谁在说话”自动禁用）
+sherpa-onnx>=1.13
