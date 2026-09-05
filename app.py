@@ -640,6 +640,7 @@ class Recorder:
         channels: int = CHANNELS,
         keep_preroll: bool = False,
         preroll: bytes = b"",
+        preroll_ended_at: float = 0.0,
         label: str = "主录音",
     ):
         self.path = path
@@ -650,6 +651,9 @@ class Recorder:
         self.blocksize = max(1, samplerate // 10)
         self.label = label
         self.preroll_seconds = 0.0
+        self.preroll_ended_at = preroll_ended_at
+        self.audio_started_at = 0.0
+        self.live_started_at = 0.0
         self._initial = preroll
         self._preroll: collections.deque[bytes] | None = (
             collections.deque(maxlen=int(PREROLL_SEC * samplerate / self.blocksize)) if keep_preroll else None
@@ -664,6 +668,7 @@ class Recorder:
         self.stalled_seconds = 0.0
         self.events: list[str] = []
         self.last_data_at = 0.0
+        self.last_capture_ended_at = 0.0
         self.started_at = 0.0
         self.stopped_at = 0.0
         self._writer: WavWriter | None = None
@@ -677,7 +682,11 @@ class Recorder:
     @property
     def error(self) -> str | None:
         # A recovered capture stall must never hide a file that stopped being written.
-        return self.write_error or self.capture_error
+        if self.stalled_seconds > 0:
+            gap_error = f"录音采集曾中断，时间轴丢失约 {self.stalled_seconds:.1f} 秒"
+        else:
+            gap_error = None
+        return self.write_error or self.capture_error or gap_error
 
     @property
     def recorded_seconds(self) -> float:
@@ -688,7 +697,7 @@ class Recorder:
         if not self.started_at:
             return self.recorded_seconds
         end = self.stopped_at or time.monotonic()
-        return self.preroll_seconds + max(0.0, end - self.started_at - self.stalled_seconds)
+        return self.preroll_seconds + max(0.0, end - self.started_at)
 
     @property
     def idle_seconds(self) -> float:
@@ -703,6 +712,8 @@ class Recorder:
                 self._writer.flush()
                 self.frames_written += len(self._initial) // SAMPLE_WIDTH
                 self.preroll_seconds = self.frames_written / self.samplerate
+                if self.preroll_ended_at:
+                    self.audio_started_at = self.preroll_ended_at - self.preroll_seconds
         self.started_at = time.monotonic()
         self.last_data_at = self.started_at
         self._consumer = threading.Thread(target=self._consume, daemon=True)
@@ -733,10 +744,29 @@ class Recorder:
         self._stream = stream
 
     def _callback(self, indata, frames, time_info, status) -> None:
-        del frames, time_info
         if status.input_overflow:
             self.overflowed = True
-        self.last_data_at = time.monotonic()
+        captured_at = time.monotonic()
+        self.last_data_at = captured_at
+        block_seconds = frames / self.samplerate
+        try:
+            adc_time = float(time_info.inputBufferAdcTime)
+            callback_time = float(time_info.currentTime)
+            if not math.isfinite(adc_time) or not math.isfinite(callback_time):
+                raise ValueError("invalid PortAudio capture timestamp")
+            block_started_at = captured_at + adc_time - callback_time
+        except (AttributeError, TypeError, ValueError):
+            block_started_at = captured_at - block_seconds
+        self.last_capture_ended_at = block_started_at + block_seconds
+        if not self.live_started_at:
+            self.live_started_at = block_started_at
+            if self.preroll_ended_at and self.preroll_seconds:
+                self.audio_started_at = self.preroll_ended_at - self.preroll_seconds
+                gap_frames = round(max(0.0, self.live_started_at - self.preroll_ended_at) * self.samplerate)
+                if gap_frames:
+                    self._queue.put(bytes(gap_frames * SAMPLE_WIDTH))
+            else:
+                self.audio_started_at = self.live_started_at
         self._queue.put(downmix_to_mono(bytes(indata), self.channels))
 
     def _consume(self) -> None:
@@ -969,12 +999,10 @@ def choose_microphone_recording(primary: Recorder, backup: Recorder | None) -> P
 
 
 def track_start_offsets(*recorders: Recorder) -> list[float]:
-    """Seconds to delay each track so all share the timeline of the earliest one.
-
-    A track's first sample was captured at ``started_at - preroll_seconds`` on the
-    monotonic clock, so aligning those origins also absorbs device setup latency.
-    """
-    origins = [recorder.started_at - recorder.preroll_seconds for recorder in recorders]
+    """Delay tracks so their first captured samples share one monotonic timeline."""
+    origins = [recorder.audio_started_at for recorder in recorders]
+    if any(origin <= 0 for origin in origins):
+        raise RuntimeError("录音轨缺少实际采集起点，无法可靠对齐")
     base = min(origins)
     return [origin - base for origin in origins]
 
@@ -1417,19 +1445,20 @@ class MeetingApp(tk.Tk):
                 text=f"正在录音，声音正常{note}{self._backup_note()}。", foreground="#207020"
             )
 
-    def _take_preroll(self, system: bool = False) -> bytes:
+    def _take_preroll(self, system: bool = False) -> tuple[bytes, float]:
         monitor = self.system_monitor if system else self.monitor
         if system:
             self.system_monitor = None
         else:
             self.monitor = None
         if monitor is None:
-            return b""
+            return b"", 0.0
         try:
             monitor.stop()
-            return monitor.preroll_bytes()
+            data = monitor.preroll_bytes()
+            return data, monitor.last_capture_ended_at if data else 0.0
         except Exception:
-            return b""
+            return b"", 0.0
 
     def _start_backup(self, primary: int | None, backup_path: Path) -> Recorder | None:
         for index, _candidate_extra in backup_candidates(primary):
@@ -1481,7 +1510,7 @@ class MeetingApp(tk.Tk):
             device = self._selected_device()
             if device is None:
                 raise RuntimeError("没有选择麦克风")
-            preroll = self._take_preroll()
+            preroll, preroll_ended_at = self._take_preroll()
             rate, channels, extra = input_capture_settings(device)
             recorder = Recorder(
                 primary_path,
@@ -1490,6 +1519,7 @@ class MeetingApp(tk.Tk):
                 samplerate=rate,
                 channels=channels,
                 preroll=preroll,
+                preroll_ended_at=preroll_ended_at,
                 label="麦克风主录音",
             )
             recorder.start()
@@ -1498,7 +1528,7 @@ class MeetingApp(tk.Tk):
                 system_path = paths["system"]
                 if system_device is None or system_path is None:
                     raise RuntimeError("没有可用的电脑系统声音输入")
-                system_preroll = self._take_preroll(system=True)
+                system_preroll, system_preroll_ended_at = self._take_preroll(system=True)
                 rate, channels, extra = input_capture_settings(system_device)
                 system_recorder = Recorder(
                     system_path,
@@ -1507,6 +1537,7 @@ class MeetingApp(tk.Tk):
                     samplerate=rate,
                     channels=channels,
                     preroll=system_preroll,
+                    preroll_ended_at=system_preroll_ended_at,
                     label="系统声音",
                 )
                 system_recorder.start()
@@ -1646,6 +1677,9 @@ class MeetingApp(tk.Tk):
     def _mix_complete_recording(self, microphone: Recorder, microphone_path: Path, system: Recorder) -> None:
         if self.audio_path is None or system.path is None:
             raise RuntimeError("系统声音没有文件路径")
+        failures = recording_failures(microphone, system)
+        if failures:
+            raise RuntimeError("必要音轨的时间轴不完整，不能可靠合成：\n" + "\n".join(failures))
         offsets = track_start_offsets(microphone, system)
         mix_wav_tracks([microphone_path, system.path], self.audio_path, start_offsets=offsets)
         expected = max(

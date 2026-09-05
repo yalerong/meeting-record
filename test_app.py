@@ -11,6 +11,7 @@ from unittest import mock
 
 from app import (
     MAX_WAV_DATA_BYTES,
+    MeetingApp,
     SYSTEM_AUDIO_UNRECOGNISED_SUFFIX,
     WavWriter,
     Recorder,
@@ -124,12 +125,44 @@ class WavWriterTest(unittest.TestCase):
         with mock.patch("app.time.monotonic", return_value=111.5):
             self.assertEqual(recorder.expected_seconds, 15.5)
 
-    def test_expected_seconds_excludes_time_lost_to_device_reconnects(self):
+    def test_expected_seconds_includes_time_lost_to_device_reconnects(self):
         recorder = Recorder(None)
         recorder.started_at = 100.0
         recorder.stalled_seconds = 3.0
         with mock.patch("app.time.monotonic", return_value=111.5):
-            self.assertEqual(recorder.expected_seconds, 8.5)
+            self.assertEqual(recorder.expected_seconds, 11.5)
+
+    def test_preroll_handoff_inserts_the_uncaptured_gap(self):
+        recorder = Recorder(None, samplerate=10, preroll=struct.pack("<10h", *range(10)))
+        recorder.preroll_seconds = 1.0
+        recorder.preroll_ended_at = 100.0
+
+        with mock.patch("app.time.monotonic", return_value=101.2):
+            recorder._callback(
+                bytearray(struct.pack("<2h", 100, 200)),
+                2,
+                None,
+                SimpleNamespace(input_overflow=False),
+            )
+
+        queued = list(recorder._queue.queue)
+        self.assertEqual(queued, [bytes(20), struct.pack("<2h", 100, 200)])
+        self.assertEqual(getattr(recorder, "audio_started_at", None), 99.0)
+
+    def test_callback_maps_adc_capture_time_onto_the_monotonic_clock(self):
+        recorder = Recorder(None, samplerate=10)
+
+        with mock.patch("app.time.monotonic", return_value=500.0):
+            recorder._callback(
+                bytearray(struct.pack("<2h", 100, 200)),
+                2,
+                SimpleNamespace(inputBufferAdcTime=10.0, currentTime=10.5),
+                SimpleNamespace(input_overflow=False),
+            )
+
+        self.assertEqual(recorder.last_data_at, 500.0)
+        self.assertEqual(recorder.live_started_at, 499.5)
+        self.assertEqual(getattr(recorder, "last_capture_ended_at", None), 499.7)
 
     @mock.patch("app.sd.RawInputStream")
     def test_stream_reconnect_keeps_write_error_visible(self, _stream):
@@ -144,6 +177,18 @@ class WavWriterTest(unittest.TestCase):
         self.assertIsNone(recorder.capture_error)
         self.assertEqual(recorder.error, "录音落盘失败：disk full")
         self.assertEqual(recorder.stalled_seconds, 4.0)
+
+    @mock.patch("app.sd.RawInputStream")
+    def test_recovered_stream_gap_remains_a_recording_error(self, _stream):
+        recorder = Recorder(Path("unused.wav"))
+        recorder.last_data_at = 100.0
+
+        with mock.patch("app.time.monotonic", return_value=104.0):
+            recorder._restart_stream()
+
+        self.assertEqual(recorder.restarts, 1)
+        self.assertIsNone(recorder.capture_error)
+        self.assertIn("丢失", recorder.error or "")
 
     def test_consumer_finalizes_writer_when_it_exits(self):
         recorder = Recorder(Path("unused.wav"))
@@ -543,15 +588,67 @@ class AudioMixTest(unittest.TestCase):
 
 
 class RecordingPlanTest(unittest.TestCase):
-    def test_track_offsets_use_capture_start_times_not_just_preroll_lengths(self):
-        microphone = cast(Recorder, SimpleNamespace(started_at=100.0, preroll_seconds=30.0))
-        system = cast(Recorder, SimpleNamespace(started_at=100.8, preroll_seconds=30.0))
-        for actual, expected in zip(track_start_offsets(microphone, system), [0.0, 0.8], strict=True):
+    def test_track_offsets_use_actual_audio_origins(self):
+        microphone = cast(
+            Recorder,
+            SimpleNamespace(audio_started_at=70.0, started_at=100.0, preroll_seconds=30.0),
+        )
+        system = cast(
+            Recorder,
+            SimpleNamespace(audio_started_at=70.2, started_at=100.8, preroll_seconds=30.0),
+        )
+        for actual, expected in zip(track_start_offsets(microphone, system), [0.0, 0.2], strict=True):
             self.assertAlmostEqual(actual, expected)
 
-        short_preroll = cast(Recorder, SimpleNamespace(started_at=100.5, preroll_seconds=4.0))
-        for actual, expected in zip(track_start_offsets(microphone, short_preroll), [0.0, 26.5], strict=True):
+        short_preroll = cast(
+            Recorder,
+            SimpleNamespace(audio_started_at=96.4, started_at=100.5, preroll_seconds=4.0),
+        )
+        for actual, expected in zip(track_start_offsets(microphone, short_preroll), [0.0, 26.4], strict=True):
             self.assertAlmostEqual(actual, expected)
+
+    def test_take_preroll_keeps_the_last_capture_boundary(self):
+        app = object.__new__(MeetingApp)
+        monitor = mock.Mock(last_capture_ended_at=123.4, last_data_at=999.0)
+        monitor.preroll_bytes.return_value = b"audio"
+        app.monitor = monitor
+        app.system_monitor = None
+
+        self.assertEqual(app._take_preroll(), (b"audio", 123.4))
+        monitor.stop.assert_called_once_with()
+
+    def test_complete_mix_rejects_a_track_with_a_recovered_gap(self):
+        app = object.__new__(MeetingApp)
+        app.audio_path = Path("complete.wav")
+        microphone_path = Path("mic.wav")
+        microphone = cast(
+            Recorder,
+            SimpleNamespace(
+                label="麦克风",
+                error="录音采集曾中断，时间轴丢失约 3.0 秒",
+                path=microphone_path,
+                audio_started_at=100.0,
+                recorded_seconds=60.0,
+            ),
+        )
+        system = cast(
+            Recorder,
+            SimpleNamespace(
+                label="系统声音",
+                error=None,
+                path=Path("system.wav"),
+                audio_started_at=100.0,
+                recorded_seconds=60.0,
+            ),
+        )
+
+        with (
+            mock.patch("app.mix_wav_tracks") as mix,
+            mock.patch("app.verify_wav_file"),
+            self.assertRaisesRegex(RuntimeError, "时间轴不完整"),
+        ):
+            app._mix_complete_recording(microphone, microphone_path, system)
+        mix.assert_not_called()
 
     def test_stopping_recorders_attempts_every_track_after_one_fails(self):
         primary = mock.Mock(label="麦克风")
