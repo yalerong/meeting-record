@@ -48,6 +48,7 @@ STALL_WARN_SEC = 3.0
 FLUSH_INTERVAL_SEC = 5.0
 PREROLL_SEC = 30.0
 MIN_FREE_BYTES = 2 * 1024 ** 3
+MAX_WAV_DATA_BYTES = 0xFFFF_FFFF - 36  # RIFF sizes are 32-bit
 SLEEP_REASSERT_SEC = 30.0
 DIARIZE_THRESHOLD = 0.5
 
@@ -142,6 +143,15 @@ def select_input_format(
     raise RuntimeError("设备不支持可用的 PCM 录音格式")
 
 
+def downmix_to_mono(data: bytes, channels: int) -> bytes:
+    if channels <= 1:
+        return data
+    import numpy
+
+    samples = numpy.frombuffer(data, dtype="<i2").reshape(-1, channels)
+    return samples.mean(axis=1).astype("<i2").tobytes()
+
+
 def _resampled_mono_block(
     handle,
     output_start: int,
@@ -162,7 +172,7 @@ def _resampled_mono_block(
     valid = (positions >= 0) & (positions < source_frames)
     result: Any = numpy.zeros(count, dtype=numpy.float64)
     if not valid.any():
-        return result, valid
+        return result
 
     valid_positions = positions[valid]
     source_start = int(numpy.floor(valid_positions[0]))
@@ -173,7 +183,7 @@ def _resampled_mono_block(
     mono = samples.astype(numpy.float64).mean(axis=1)
     source_axis: Any = numpy.arange(source_start, source_start + len(mono), dtype=numpy.float64)
     result[valid] = numpy.interp(valid_positions, source_axis, mono)
-    return result, valid
+    return result
 
 
 def mix_wav_tracks(
@@ -207,19 +217,17 @@ def mix_wav_tracks(
         for start in range(0, total_frames, chunk_frames):
             count = min(chunk_frames, total_frames - start)
             mixed = numpy.zeros(count, dtype=numpy.float64)
-            contributors = numpy.zeros(count, dtype=numpy.int16)
             for handle, offset in zip(handles, offsets, strict=True):
-                block, valid = _resampled_mono_block(
+                mixed += _resampled_mono_block(
                     handle,
                     start,
                     count,
                     output_rate,
                     start_offset=offset,
                 )
-                mixed += block
-                contributors += valid & (numpy.abs(block) >= SILENCE_PEAK)
-            # Do not halve one speaking side merely because the other track is silent.
-            numpy.divide(mixed, contributors, out=mixed, where=contributors > 1)
+            # Plain sum: any per-sample gain switching distorts speech, and a constant
+            # halving would quiet whichever side is speaking alone. Clipping only
+            # happens when both sides are loud at the same instant.
             numpy.clip(mixed, -32_768, 32_767, out=mixed)
             writer.write(mixed.astype("<i2").tobytes())
     finally:
@@ -242,8 +250,11 @@ def wav_stats(path: Path) -> tuple[float, int]:
     return frames / rate, peak
 
 
-def verify_wav_file(path: Path, expected_seconds: float = 0.0) -> tuple[float, int]:
-    duration, peak = wav_stats(path)
+def verify_wav_file(path: Path, expected_seconds: float = 0.0) -> float:
+    # Header only: recorders already track the peak, and scanning multi-GB tracks
+    # would freeze the UI thread.
+    with wave.open(str(path)) as handle:
+        duration = handle.getnframes() / (handle.getframerate() or SAMPLE_RATE)
     if duration <= 0:
         raise RuntimeError(f"录音文件没有音频数据：{path.name}")
     if expected_seconds > 0:
@@ -252,7 +263,16 @@ def verify_wav_file(path: Path, expected_seconds: float = 0.0) -> tuple[float, i
             raise RuntimeError(
                 f"录音时长异常：{path.name} 只有 {duration:.1f} 秒，程序记录了 {expected_seconds:.1f} 秒"
             )
-    return duration, peak
+    return duration
+
+
+def diarization_source(path: Path, dest: Path) -> Path:
+    """Return ``path`` if it is already 16 kHz mono, otherwise write such a copy to ``dest``."""
+    with wave.open(str(path)) as handle:
+        if handle.getframerate() == SAMPLE_RATE and handle.getnchannels() == 1:
+            return path
+    mix_wav_tracks([path], dest)
+    return dest
 
 
 def boost_wav(src: Path, dst: Path, peak: int) -> float:
@@ -587,6 +607,8 @@ class WavWriter:
         )
 
     def write(self, data: bytes) -> None:
+        if self.frames * self.frame_bytes + len(data) > MAX_WAV_DATA_BYTES:
+            raise RuntimeError("录音文件已达到 WAV 格式的 4GB 上限，请分段录制")
         self._file.write(data)
         self.frames += len(data) // self.frame_bytes
 
@@ -637,7 +659,9 @@ class Recorder:
         self.max_peak = 0
         self.overflowed = False
         self.restarts = 0
-        self.error: str | None = None
+        self.capture_error: str | None = None
+        self.write_error: str | None = None
+        self.stalled_seconds = 0.0
         self.events: list[str] = []
         self.last_data_at = 0.0
         self.started_at = 0.0
@@ -651,6 +675,11 @@ class Recorder:
         self._lock = threading.RLock()
 
     @property
+    def error(self) -> str | None:
+        # A recovered capture stall must never hide a file that stopped being written.
+        return self.write_error or self.capture_error
+
+    @property
     def recorded_seconds(self) -> float:
         return self.frames_written / self.samplerate
 
@@ -659,7 +688,7 @@ class Recorder:
         if not self.started_at:
             return self.recorded_seconds
         end = self.stopped_at or time.monotonic()
-        return self.preroll_seconds + max(0.0, end - self.started_at)
+        return self.preroll_seconds + max(0.0, end - self.started_at - self.stalled_seconds)
 
     @property
     def idle_seconds(self) -> float:
@@ -667,11 +696,12 @@ class Recorder:
 
     def start(self) -> None:
         if self.path is not None:
-            self._writer = WavWriter(self.path, self.samplerate, self.channels)
+            # The file is always mono; stereo-only devices are downmixed in the callback.
+            self._writer = WavWriter(self.path, self.samplerate, 1)
             if self._initial:
                 self._writer.write(self._initial)
                 self._writer.flush()
-                self.frames_written += len(self._initial) // (SAMPLE_WIDTH * self.channels)
+                self.frames_written += len(self._initial) // SAMPLE_WIDTH
                 self.preroll_seconds = self.frames_written / self.samplerate
         self.started_at = time.monotonic()
         self.last_data_at = self.started_at
@@ -707,9 +737,23 @@ class Recorder:
         if status.input_overflow:
             self.overflowed = True
         self.last_data_at = time.monotonic()
-        self._queue.put(bytes(indata))
+        self._queue.put(downmix_to_mono(bytes(indata), self.channels))
 
     def _consume(self) -> None:
+        try:
+            self._consume_loop()
+        finally:
+            # The consumer owns the writer: finalize the header even if stop() gave up waiting.
+            writer = self._writer
+            self._writer = None
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception as error:
+                    self._note(f"关闭录音文件失败：{error}")
+                    self.write_error = f"关闭录音文件失败：{error}"
+
+    def _consume_loop(self) -> None:
         next_flush = time.monotonic() + FLUSH_INTERVAL_SEC
         while True:
             try:
@@ -731,7 +775,7 @@ class Recorder:
                         self._writer.write(data)
                     except Exception as error:
                         self._note(f"写入录音文件失败：{error}")
-                        self.error = f"写入录音文件失败：{error}"
+                        self.write_error = f"写入录音文件失败：{error}"
                         failed_writer = self._writer
                         self._writer = None
                         try:
@@ -739,13 +783,13 @@ class Recorder:
                         except Exception:
                             pass
                         continue
-                self.frames_written += len(data) // (SAMPLE_WIDTH * self.channels)
+                self.frames_written += len(data) // SAMPLE_WIDTH
             if self._writer is not None and time.monotonic() >= next_flush:
                 try:
                     self._writer.flush()
                 except Exception as error:
                     self._note(f"落盘失败：{error}")
-                    self.error = f"录音落盘失败：{error}"
+                    self.write_error = f"录音落盘失败：{error}"
                     failed_writer = self._writer
                     self._writer = None
                     try:
@@ -771,15 +815,17 @@ class Recorder:
                 except Exception:
                     pass
                 self._stream = None
-            self.last_data_at = time.monotonic()
+            now = time.monotonic()
+            self.stalled_seconds += now - self.last_data_at
+            self.last_data_at = now
             try:
                 self._open_stream()
                 self.restarts += 1
                 self._note(f"[{stamp}] 麦克风采集中断，已自动重开（第 {self.restarts} 次）")
-                self.error = None
+                self.capture_error = None
             except Exception as error:
                 self._note(f"[{stamp}] 麦克风采集中断，重开失败：{error}")
-                self.error = f"麦克风采集中断且暂时无法恢复：{error}"
+                self.capture_error = f"麦克风采集中断且暂时无法恢复：{error}"
 
     def preroll_bytes(self) -> bytes:
         if self._preroll is None:
@@ -807,9 +853,9 @@ class Recorder:
         if self._consumer is not None:
             self._consumer.join(timeout=15)
             if self._consumer.is_alive():
-                self.error = "音频写盘线程未能在 15 秒内完成，录音文件可能缺少末尾内容"
-                self._note(self.error)
-                raise RuntimeError(self.error)
+                self.write_error = "音频写盘线程未能在 15 秒内完成，录音文件可能缺少末尾内容"
+                self._note(self.write_error)
+                raise RuntimeError(self.write_error)
             self._consumer = None
         if self._writer is not None:
             try:
@@ -832,9 +878,11 @@ def preferred_microphone_device(default_index: int, available_indices: list[int]
         return None
     try:
         devices = sd.query_devices()
-        default_name = devices[default_index]["name"].strip()
+        default_name = devices[default_index]["name"].strip() if 0 <= default_index < len(devices) else ""
         matching = [
-            index for index in available_indices if devices[index]["name"].strip() == default_name
+            index
+            for index in available_indices
+            if default_name and devices[index]["name"].strip() == default_name
         ]
         if matching:
             return min(
@@ -849,13 +897,21 @@ def preferred_microphone_device(default_index: int, available_indices: list[int]
     return default_index if default_index in available_indices else available_indices[0]
 
 
+SYSTEM_AUDIO_UNRECOGNISED_SUFFIX = "（非系统回放端点，仅虚拟声卡输出可用）"
+
+
 def system_input_devices() -> list[tuple[int, str]]:
     devices = []
     for index, device in enumerate(sd.query_devices()):
-        if device["max_input_channels"] > 0 and is_system_audio_input(device["name"]):
-            api = sd.query_hostapis(device["hostapi"])["name"]
-            devices.append((index, f"{device['name']}  [{api}]"))
-    devices.sort(key=lambda item: (*system_audio_priority(item[1]), item[0]))
+        if device["max_input_channels"] <= 0:
+            continue
+        api = sd.query_hostapis(device["hostapi"])["name"]
+        name = f"{device['name']}  [{api}]"
+        if not is_system_audio_input(device["name"]):
+            # Virtual cables (VB-Cable, VoiceMeeter) carry system audio under arbitrary names.
+            name += SYSTEM_AUDIO_UNRECOGNISED_SUFFIX
+        devices.append((index, name))
+    devices.sort(key=lambda item: (not is_system_audio_input(item[1]), *system_audio_priority(item[1]), item[0]))
     return devices
 
 
@@ -912,6 +968,17 @@ def choose_microphone_recording(primary: Recorder, backup: Recorder | None) -> P
     return backup.path if score(backup) > score(primary) else primary.path
 
 
+def track_start_offsets(*recorders: Recorder) -> list[float]:
+    """Seconds to delay each track so all share the timeline of the earliest one.
+
+    A track's first sample was captured at ``started_at - preroll_seconds`` on the
+    monotonic clock, so aligning those origins also absorbs device setup latency.
+    """
+    origins = [recorder.started_at - recorder.preroll_seconds for recorder in recorders]
+    base = min(origins)
+    return [origin - base for origin in origins]
+
+
 def recording_failures(*recorders: Recorder | None) -> list[str]:
     return [f"{recorder.label}：{recorder.error}" for recorder in recorders if recorder and recorder.error]
 
@@ -925,7 +992,7 @@ def stop_recorders_safely(*recorders: Recorder | None) -> list[str]:
             recorder.stop()
         except Exception as error:
             if recorder.error is None:
-                recorder.error = str(error)
+                recorder.write_error = str(error)
             errors.append(f"{recorder.label}：{error}")
     return errors
 
@@ -1191,7 +1258,7 @@ class MeetingApp(tk.Tk):
                 self.monitor = None
                 self.start_button.config(state="disabled")
                 self.level_hint.config(
-                    text="线上模式没有找到系统声音输入。请在 Windows 录音设备中启用“立体声混音”，再点刷新。",
+                    text="线上模式没有找到任何可用的系统声音输入。请在 Windows 录音设备中启用“立体声混音”，再点刷新。",
                     foreground="#c00000",
                 )
                 return
@@ -1509,66 +1576,50 @@ class MeetingApp(tk.Tk):
                 self.status_label.config(text="必要音轨写入失败，已停止自动处理；现有文件仍保留在结果目录。")
                 self._restore_ready_controls()
                 return
-        validation_errors = []
+        invalid: list[tuple[Recorder, str]] = []
         for track in (recorder, backup, system):
             if track is None or track.path is None:
                 continue
             try:
                 verify_wav_file(track.path, track.expected_seconds)
             except Exception as error:
-                validation_errors.append(f"{track.label}：{error}")
-        if validation_errors:
+                invalid.append((track, f"{track.label}：{error}"))
+        chosen_mic_path = choose_microphone_recording(recorder, backup)
+        chosen_recorder = backup if backup is not None and chosen_mic_path == backup.path else recorder
+        # A short system track would be mixed against the full microphone track and shift
+        # every later remote sentence earlier, so it must block processing like the mic does.
+        if any(track is chosen_recorder or track is system for track, _message in invalid):
+            messagebox.showerror(
+                "录音不可用",
+                "必要音轨没有通过完整性校验，已停止自动处理。全部文件仍保留在结果目录，"
+                "可用“处理已有录音…”手动重试。\n\n" + "\n".join(message for _track, message in invalid),
+            )
+            self.status_label.config(text="必要音轨校验失败，已停止自动处理；现有文件仍保留在结果目录。")
+            self._restore_ready_controls()
+            return
+        if invalid:
             messagebox.showwarning(
                 "录音文件校验失败",
-                "以下音轨可能不完整，请保留全部文件并查看录音日志：\n\n" + "\n".join(validation_errors),
+                "以下音轨可能不完整，请保留全部文件并查看录音日志：\n\n"
+                + "\n".join(message for _track, message in invalid),
             )
-        chosen_mic_path = choose_microphone_recording(recorder, backup)
         if chosen_mic_path != recorder.path:
             messagebox.showinfo(
                 "改用备份录音",
                 "麦克风备份比主录音更完整，将用备份轨生成完整录音；两份原轨都会保留。",
             )
-        mic_peak = backup.max_peak if backup is not None and chosen_mic_path == backup.path else recorder.max_peak
+        mic_peak = chosen_recorder.max_peak
         chosen_path = chosen_mic_path
         if system is not None:
-            if system.path is None:
-                messagebox.showerror("无法生成完整录音", "系统声音没有文件路径；麦克风原轨仍已保留。")
-                self._restore_ready_controls()
-                return
             self.status_label.config(text="原始音轨已保存，正在生成完整录音……")
+            self.update_idletasks()
             try:
-                chosen_recorder = backup if backup is not None and chosen_mic_path == backup.path else recorder
-                common_preroll = max(chosen_recorder.preroll_seconds, system.preroll_seconds)
-                offsets = [
-                    common_preroll - chosen_recorder.preroll_seconds,
-                    common_preroll - system.preroll_seconds,
-                ]
-                mix_wav_tracks(
-                    [chosen_mic_path, system.path],
-                    self.audio_path,
-                    start_offsets=offsets,
-                )
-                expected = max(
-                    offsets[0] + chosen_recorder.recorded_seconds,
-                    offsets[1] + system.recorded_seconds,
-                )
-                verify_wav_file(self.audio_path, expected)
+                self._mix_complete_recording(chosen_recorder, chosen_mic_path, system)
                 chosen_path = self.audio_path
             except Exception as error:
                 messagebox.showerror(
                     "无法生成完整录音",
                     f"麦克风和系统声音原轨仍已保留，但完整录音生成失败。\n\n{error}",
-                )
-                self._restore_ready_controls()
-                return
-        else:
-            chosen_recorder = backup if backup is not None and chosen_mic_path == backup.path else recorder
-            try:
-                verify_wav_file(chosen_path, chosen_recorder.expected_seconds)
-            except Exception as error:
-                messagebox.showerror(
-                    "录音不可用",
-                    f"录音文件没有通过完整性校验，请检查其他原轨和录音日志。\n\n{error}",
                 )
                 self._restore_ready_controls()
                 return
@@ -1591,6 +1642,17 @@ class MeetingApp(tk.Tk):
         warning = "（录音期间检测到输入溢出，请重点检查音频）" if recorder.overflowed else ""
         self.status_label.config(text=f"录音已保存{warning}。正在准备转写……")
         self._start_processing(self.meeting_dir, chosen_path, self.meeting_title)
+
+    def _mix_complete_recording(self, microphone: Recorder, microphone_path: Path, system: Recorder) -> None:
+        if self.audio_path is None or system.path is None:
+            raise RuntimeError("系统声音没有文件路径")
+        offsets = track_start_offsets(microphone, system)
+        mix_wav_tracks([microphone_path, system.path], self.audio_path, start_offsets=offsets)
+        expected = max(
+            offsets[0] + microphone.recorded_seconds,
+            offsets[1] + system.recorded_seconds,
+        )
+        verify_wav_file(self.audio_path, expected)
 
     def _restore_ready_controls(self) -> None:
         self.start_button.config(state="normal")
@@ -1738,6 +1800,7 @@ class MeetingApp(tk.Tk):
     def _process_meeting(self, meeting_dir: Path, audio_path: Path, title: str) -> None:
         transcript_path = meeting_dir / "逐字稿.txt"
         boosted_path: Path | None = None
+        diarize_copy = meeting_dir / "_分离副本.wav"
         stages = self.stage_count
         try:
             total_seconds, peak = wav_stats(audio_path)
@@ -1816,7 +1879,7 @@ class MeetingApp(tk.Tk):
             if plain_lines and not cancelled and self.diarize_now:
                 try:
                     self._say(f"阶段 2/{stages} 正在识别谁在说话……")
-                    turns = diarize(source_path, progress=self._diarize_progress)
+                    turns = diarize(diarization_source(source_path, diarize_copy), progress=self._diarize_progress)
                     labels = label_speakers(spans, turns)
                     speakers = len({label for label in labels if label is not None})
                     if speakers >= 2:
@@ -1875,11 +1938,12 @@ class MeetingApp(tk.Tk):
                 pass
             self._post(self._processing_done, str(error), "")
         finally:
-            if boosted_path is not None:
-                try:
-                    boosted_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            for temporary in (boosted_path, diarize_copy):
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     def _begin_minutes_phase(self) -> None:
         self.progress.config(mode="indeterminate")
@@ -1933,21 +1997,7 @@ class MeetingApp(tk.Tk):
                 ):
                     mic_path = choose_microphone_recording(recorder, backup)
                     chosen_recorder = backup if backup is not None and mic_path == backup.path else recorder
-                    common_preroll = max(chosen_recorder.preroll_seconds, system.preroll_seconds)
-                    offsets = [
-                        common_preroll - chosen_recorder.preroll_seconds,
-                        common_preroll - system.preroll_seconds,
-                    ]
-                    mix_wav_tracks(
-                        [mic_path, system.path],
-                        self.audio_path,
-                        start_offsets=offsets,
-                    )
-                    expected = max(
-                        offsets[0] + chosen_recorder.recorded_seconds,
-                        offsets[1] + system.recorded_seconds,
-                    )
-                    verify_wav_file(self.audio_path, expected)
+                    self._mix_complete_recording(chosen_recorder, mic_path, system)
             except Exception as error:
                 messagebox.showwarning(
                     "录音收尾未完成",

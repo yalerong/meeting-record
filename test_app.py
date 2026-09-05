@@ -1,4 +1,5 @@
 import struct
+import math
 import tempfile
 import unittest
 import wave
@@ -9,6 +10,8 @@ from typing import cast
 from unittest import mock
 
 from app import (
+    MAX_WAV_DATA_BYTES,
+    SYSTEM_AUDIO_UNRECOGNISED_SUFFIX,
     WavWriter,
     Recorder,
     backup_candidates,
@@ -35,7 +38,10 @@ from app import (
     choose_microphone_recording,
     recording_failures,
     stop_recorders_safely,
+    track_start_offsets,
     verify_wav_file,
+    diarization_source,
+    downmix_to_mono,
 )
 
 
@@ -118,6 +124,47 @@ class WavWriterTest(unittest.TestCase):
         with mock.patch("app.time.monotonic", return_value=111.5):
             self.assertEqual(recorder.expected_seconds, 15.5)
 
+    def test_expected_seconds_excludes_time_lost_to_device_reconnects(self):
+        recorder = Recorder(None)
+        recorder.started_at = 100.0
+        recorder.stalled_seconds = 3.0
+        with mock.patch("app.time.monotonic", return_value=111.5):
+            self.assertEqual(recorder.expected_seconds, 8.5)
+
+    @mock.patch("app.sd.RawInputStream")
+    def test_stream_reconnect_keeps_write_error_visible(self, _stream):
+        recorder = Recorder(Path("unused.wav"))
+        recorder.last_data_at = 100.0
+        recorder.write_error = "录音落盘失败：disk full"
+        recorder.capture_error = "麦克风采集中断且暂时无法恢复：x"
+        with mock.patch("app.time.monotonic", return_value=104.0):
+            recorder._restart_stream()
+
+        self.assertEqual(recorder.restarts, 1)
+        self.assertIsNone(recorder.capture_error)
+        self.assertEqual(recorder.error, "录音落盘失败：disk full")
+        self.assertEqual(recorder.stalled_seconds, 4.0)
+
+    def test_consumer_finalizes_writer_when_it_exits(self):
+        recorder = Recorder(Path("unused.wav"))
+        writer = mock.Mock()
+        recorder._writer = writer
+        recorder._queue.put(None)
+
+        recorder._consume()
+
+        writer.close.assert_called_once_with()
+        self.assertIsNone(recorder._writer)
+        self.assertIsNone(recorder.error)
+
+    def test_wav_writer_refuses_to_exceed_riff_size_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            writer = WavWriter(Path(folder) / "t.wav")
+            writer.frames = MAX_WAV_DATA_BYTES // 2
+            with self.assertRaisesRegex(RuntimeError, "4GB"):
+                writer.write(struct.pack("<2h", 1, 1))
+            writer.close()
+
     def test_flush_leaves_a_playable_file_mid_recording(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "t.wav"
@@ -181,6 +228,16 @@ class AudioSourceTest(unittest.TestCase):
 
         self.assertEqual(selected, 1)
 
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_missing_windows_default_microphone_falls_back_to_first_input(self, query_devices, _hostapis):
+        query_devices.return_value = [
+            {"name": "Microphone Array", "max_input_channels": 2, "hostapi": 0},
+            {"name": "USB Microphone", "max_input_channels": 1, "hostapi": 0},
+        ]
+
+        self.assertEqual(preferred_microphone_device(-1, [0, 1]), 0)
+
     @mock.patch("app.sd.WasapiSettings")
     @mock.patch("app.sd.query_hostapis")
     @mock.patch("app.sd.query_devices")
@@ -192,9 +249,7 @@ class AudioSourceTest(unittest.TestCase):
             {"name": "Stereo Mix", "hostapi": 1, "max_input_channels": 2},
             {"name": "USB Microphone", "hostapi": 1, "max_input_channels": 1},
         ]
-        query_devices.return_value = devices
         query_devices.side_effect = lambda index=None: devices if index is None else devices[index]
-        query_devices.return_value = devices
         query_hostapis.side_effect = lambda index=None: (
             [{"name": "MME"}, {"name": "Windows WASAPI"}]
             if index is None
@@ -245,15 +300,21 @@ class AudioSourceTest(unittest.TestCase):
 
     @mock.patch("app.sd.query_hostapis")
     @mock.patch("app.sd.query_devices")
-    def test_lists_only_system_audio_capture_endpoints(self, query_devices, query_hostapis):
+    def test_lists_system_audio_endpoints_first_and_marks_other_inputs(self, query_devices, query_hostapis):
         query_devices.return_value = [
-            {"name": "麦克风阵列", "max_input_channels": 2, "hostapi": 0},
+            {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_input_channels": 2, "hostapi": 0},
             {"name": "立体声混音", "max_input_channels": 2, "hostapi": 1},
             {"name": "扬声器", "max_input_channels": 0, "hostapi": 1},
         ]
         query_hostapis.side_effect = lambda index: {"name": ("MME", "Windows WDM-KS")[index]}
 
-        self.assertEqual(system_input_devices(), [(1, "立体声混音  [Windows WDM-KS]")])
+        self.assertEqual(
+            system_input_devices(),
+            [
+                (1, "立体声混音  [Windows WDM-KS]"),
+                (0, "CABLE Output (VB-Audio Virtual Cable)  [MME]" + SYSTEM_AUDIO_UNRECOGNISED_SUFFIX),
+            ],
+        )
 
     @mock.patch("app.sd.query_hostapis")
     @mock.patch("app.sd.query_devices")
@@ -281,6 +342,13 @@ class AudioSourceTest(unittest.TestCase):
         recorder = Recorder(None, samplerate=48_000, channels=2)
         recorder.frames_written = 24_000
         self.assertEqual(recorder.recorded_seconds, 0.5)
+
+    def test_stereo_capture_is_downmixed_to_mono_before_queueing(self):
+        self.assertEqual(downmix_to_mono(struct.pack("<4h", 100, 300, -200, 200), 2), struct.pack("<2h", 200, 0))
+        self.assertEqual(downmix_to_mono(b"ab", 1), b"ab")
+        recorder = Recorder(None, samplerate=48_000, channels=2)
+        recorder._callback(bytearray(struct.pack("<4h", 100, 300, -200, 200)), 2, None, SimpleNamespace(input_overflow=False))
+        self.assertEqual(recorder._queue.get_nowait(), struct.pack("<2h", 200, 0))
 
     @mock.patch("app.sd.WasapiSettings")
     @mock.patch("app.sd.check_input_settings")
@@ -354,7 +422,34 @@ class AudioMixTest(unittest.TestCase):
                 self.assertEqual(handle.getsampwidth(), 2)
                 self.assertEqual(handle.getnframes(), 16_000)
                 samples = struct.unpack("<16000h", handle.readframes(16_000))
-            self.assertTrue(all(1_490 <= sample <= 1_510 for sample in samples[10:-10]))
+            self.assertTrue(all(2_990 <= sample <= 3_010 for sample in samples[10:-10]))
+
+    def test_mix_of_two_live_voices_has_no_per_sample_gain_switching(self):
+        rate = 16_000
+        mic = [(int(6_000 * math.sin(2 * math.pi * 220 * i / rate)),) for i in range(rate)]
+        system = [(int(6_000 * math.sin(2 * math.pi * 330 * i / rate)),) for i in range(rate)]
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self._write_pcm(root / "mic.wav", rate, 1, mic)
+            self._write_pcm(root / "system.wav", rate, 1, system)
+
+            mix_wav_tracks([root / "mic.wav", root / "system.wav"], root / "mixed.wav")
+
+            with wave.open(str(root / "mixed.wav")) as handle:
+                mixed = struct.unpack(f"<{rate}h", handle.readframes(rate))
+        worst = max(abs(m - (a[0] + b[0])) for m, a, b in zip(mixed, mic, system, strict=True))
+        self.assertLessEqual(worst, 1)
+
+    def test_mix_clips_instead_of_wrapping_when_both_sides_are_loud(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self._write_pcm(root / "a.wav", 8_000, 1, [(20_000,)] * 800)
+            self._write_pcm(root / "b.wav", 8_000, 1, [(20_000,)] * 800)
+
+            mix_wav_tracks([root / "a.wav", root / "b.wav"], root / "mixed.wav", output_rate=8_000)
+
+            with wave.open(str(root / "mixed.wav")) as handle:
+                self.assertEqual(set(struct.unpack("<800h", handle.readframes(800))), {32_767})
 
     def test_mix_does_not_quiet_the_only_active_track(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -397,7 +492,7 @@ class AudioMixTest(unittest.TestCase):
                 handle.setpos(8_100)
                 aligned = struct.unpack("<100h", handle.readframes(100))
             self.assertTrue(all(sample == 0 for sample in first))
-            self.assertTrue(all(sample == 1_500 for sample in aligned))
+            self.assertTrue(all(sample == 3_000 for sample in aligned))
 
     def test_mix_keeps_longer_track_instead_of_truncating_audio(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -416,13 +511,28 @@ class AudioMixTest(unittest.TestCase):
                 tail = struct.unpack("<100h", handle.readframes(100))
             self.assertTrue(all(sample == 2_000 for sample in tail))
 
-    def test_verifies_playable_wav_duration_and_peak(self):
+    def test_verifies_playable_wav_duration(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "audio.wav"
             self._write_pcm(path, 8_000, 1, [(1_000,)] * 8_000)
-            duration, peak = verify_wav_file(path, expected_seconds=1.0)
-        self.assertEqual(duration, 1.0)
-        self.assertEqual(peak, 1_000)
+            self.assertEqual(verify_wav_file(path, expected_seconds=1.0), 1.0)
+
+    def test_diarization_source_resamples_non_16k_mono_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            native = root / "native.wav"
+            ready = root / "ready.wav"
+            copy = root / "copy.wav"
+            self._write_pcm(native, 48_000, 2, [(1_000, 3_000)] * 48_000)
+            self._write_pcm(ready, 16_000, 1, [(1_000,)] * 16_000)
+
+            self.assertIs(diarization_source(ready, copy), ready)
+            self.assertFalse(copy.exists())
+            self.assertEqual(diarization_source(native, copy), copy)
+            with wave.open(str(copy)) as handle:
+                self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getnframes()), (16_000, 1, 16_000))
+                samples = struct.unpack("<16000h", handle.readframes(16_000))
+            self.assertTrue(all(1_990 <= sample <= 2_010 for sample in samples[10:-10]))
 
     def test_rejects_audio_that_is_much_shorter_than_recording_session(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -433,6 +543,16 @@ class AudioMixTest(unittest.TestCase):
 
 
 class RecordingPlanTest(unittest.TestCase):
+    def test_track_offsets_use_capture_start_times_not_just_preroll_lengths(self):
+        microphone = cast(Recorder, SimpleNamespace(started_at=100.0, preroll_seconds=30.0))
+        system = cast(Recorder, SimpleNamespace(started_at=100.8, preroll_seconds=30.0))
+        for actual, expected in zip(track_start_offsets(microphone, system), [0.0, 0.8], strict=True):
+            self.assertAlmostEqual(actual, expected)
+
+        short_preroll = cast(Recorder, SimpleNamespace(started_at=100.5, preroll_seconds=4.0))
+        for actual, expected in zip(track_start_offsets(microphone, short_preroll), [0.0, 26.5], strict=True):
+            self.assertAlmostEqual(actual, expected)
+
     def test_stopping_recorders_attempts_every_track_after_one_fails(self):
         primary = mock.Mock(label="麦克风")
         primary.stop.side_effect = OSError("disk full")
