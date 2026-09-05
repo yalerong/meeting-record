@@ -2,11 +2,18 @@ import struct
 import tempfile
 import unittest
 import wave
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
+from unittest import mock
 
 from app import (
     WavWriter,
+    Recorder,
+    backup_candidates,
     block_peak,
+    input_devices,
     is_hallucination,
     label_speakers,
     speaker_name,
@@ -18,6 +25,17 @@ from app import (
     split_text,
     timestamp,
     transcription_quality,
+    is_system_audio_input,
+    mix_wav_tracks,
+    select_input_format,
+    system_input_devices,
+    input_capture_settings,
+    meeting_audio_paths,
+    preferred_microphone_device,
+    choose_microphone_recording,
+    recording_failures,
+    stop_recorders_safely,
+    verify_wav_file,
 )
 
 
@@ -81,6 +99,25 @@ class AppHelpersTest(unittest.TestCase):
 
 
 class WavWriterTest(unittest.TestCase):
+    def test_stop_surfaces_writer_drain_timeout_without_closing_it_concurrently(self):
+        recorder = Recorder(None)
+        recorder._consumer = mock.Mock()
+        recorder._consumer.is_alive.return_value = True
+        recorder._writer = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "录音文件可能缺少末尾内容"):
+            recorder.stop()
+
+        self.assertIsNotNone(recorder.error)
+        recorder._writer.close.assert_not_called()
+
+    def test_expected_seconds_uses_wall_clock_session_length(self):
+        recorder = Recorder(None)
+        recorder.started_at = 100.0
+        recorder.preroll_seconds = 4.0
+        with mock.patch("app.time.monotonic", return_value=111.5):
+            self.assertEqual(recorder.expected_seconds, 15.5)
+
     def test_flush_leaves_a_playable_file_mid_recording(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "t.wav"
@@ -97,6 +134,361 @@ class WavWriterTest(unittest.TestCase):
             with wave.open(str(path)) as handle:
                 self.assertEqual(handle.getnframes(), 12_000)
                 self.assertEqual(len(handle.readframes(12_000)), 24_000)
+
+    @mock.patch("os.fsync")
+    def test_flush_syncs_audio_to_storage(self, fsync):
+        with tempfile.TemporaryDirectory() as folder:
+            writer = WavWriter(Path(folder) / "t.wav")
+            writer.write(struct.pack("<100h", *([1_000] * 100)))
+            writer.flush()
+            writer.close()
+        self.assertGreaterEqual(fsync.call_count, 1)
+
+    def test_recorder_closes_writer_and_surfaces_write_failure(self):
+        recorder = Recorder(Path("unused.wav"))
+        writer = mock.Mock()
+        writer.write.side_effect = OSError("disk full")
+        recorder._writer = writer
+        recorder._queue.put(struct.pack("<100h", *([1_000] * 100)))
+        recorder._queue.put(None)
+
+        recorder._consume()
+
+        writer.close.assert_called_once_with()
+        self.assertIsNone(recorder._writer)
+        error = recorder.error
+        assert error is not None
+        self.assertIn("disk full", error)
+
+
+class AudioSourceTest(unittest.TestCase):
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_prefers_wasapi_variant_of_the_windows_default_microphone(
+        self, query_devices, query_hostapis
+    ):
+        devices = [
+            {"name": "Microphone Array", "max_input_channels": 2, "hostapi": 0},
+            {"name": "Microphone Array", "max_input_channels": 2, "hostapi": 1},
+            {"name": "USB Microphone", "max_input_channels": 1, "hostapi": 0},
+        ]
+        query_devices.return_value = devices
+        query_hostapis.side_effect = lambda index: {
+            "name": ("MME", "Windows WASAPI")[index]
+        }
+
+        selected = preferred_microphone_device(0, [0, 1, 2])
+
+        self.assertEqual(selected, 1)
+
+    @mock.patch("app.sd.WasapiSettings")
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_microphone_backup_candidates_exclude_system_audio_inputs(
+        self, query_devices, query_hostapis, _wasapi_settings
+    ):
+        devices = [
+            {"name": "Microphone", "hostapi": 0, "max_input_channels": 1},
+            {"name": "Stereo Mix", "hostapi": 1, "max_input_channels": 2},
+            {"name": "USB Microphone", "hostapi": 1, "max_input_channels": 1},
+        ]
+        query_devices.return_value = devices
+        query_devices.side_effect = lambda index=None: devices if index is None else devices[index]
+        query_devices.return_value = devices
+        query_hostapis.side_effect = lambda index=None: (
+            [{"name": "MME"}, {"name": "Windows WASAPI"}]
+            if index is None
+            else [{"name": "MME"}, {"name": "Windows WASAPI"}][index]
+        )
+        with mock.patch.object(type(__import__("app").sd.default), "device", (0, 0)):
+            candidates = backup_candidates(0)
+
+        self.assertEqual([index for index, _extra in candidates], [2])
+
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_microphone_device_list_excludes_system_audio_inputs(self, query_devices, query_hostapis):
+        query_devices.return_value = [
+            {"name": "麦克风阵列", "max_input_channels": 2, "hostapi": 0},
+            {"name": "立体声混音", "max_input_channels": 2, "hostapi": 1},
+            {"name": "电脑扬声器", "max_input_channels": 1, "hostapi": 1},
+        ]
+        query_hostapis.side_effect = lambda index: {"name": ("MME", "Windows WDM-KS")[index]}
+
+        self.assertEqual(input_devices(), [(0, "麦克风阵列  [MME]")])
+
+    def test_identifies_common_windows_system_audio_capture_names(self):
+        for name in (
+            "立体声混音 (Realtek HD Audio Stereo input)",
+            "电脑扬声器 (Realtek HD Audio output with SST)",
+            "Stereo Mix (Realtek Audio)",
+            "What U Hear (Sound Blaster)",
+            "Speakers [Loopback]",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(is_system_audio_input(name))
+
+    def test_does_not_treat_microphones_as_system_audio(self):
+        for name in ("麦克风阵列 (Realtek Audio)", "USB Conference Microphone"):
+            with self.subTest(name=name):
+                self.assertFalse(is_system_audio_input(name))
+
+    def test_selects_first_supported_format_in_preference_order(self):
+        attempts = []
+
+        def supports(rate, channels):
+            attempts.append((rate, channels))
+            return (rate, channels) == (48_000, 2)
+
+        self.assertEqual(select_input_format(48_000, 2, supports), (48_000, 2))
+        self.assertEqual(attempts, [(16_000, 1), (48_000, 1), (48_000, 2)])
+
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_lists_only_system_audio_capture_endpoints(self, query_devices, query_hostapis):
+        query_devices.return_value = [
+            {"name": "麦克风阵列", "max_input_channels": 2, "hostapi": 0},
+            {"name": "立体声混音", "max_input_channels": 2, "hostapi": 1},
+            {"name": "扬声器", "max_input_channels": 0, "hostapi": 1},
+        ]
+        query_hostapis.side_effect = lambda index: {"name": ("MME", "Windows WDM-KS")[index]}
+
+        self.assertEqual(system_input_devices(), [(1, "立体声混音  [Windows WDM-KS]")])
+
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_system_audio_candidates_prefer_primary_speaker_endpoint(
+        self, query_devices, query_hostapis
+    ):
+        query_devices.return_value = [
+            {"name": "立体声混音 (Realtek HD Audio Stereo input)", "max_input_channels": 2, "hostapi": 0},
+            {
+                "name": "电脑扬声器 (Realtek HD Audio 2nd output with SST)",
+                "max_input_channels": 2,
+                "hostapi": 0,
+            },
+            {
+                "name": "电脑扬声器 (Realtek HD Audio output with SST)",
+                "max_input_channels": 2,
+                "hostapi": 0,
+            },
+        ]
+        query_hostapis.return_value = {"name": "Windows WDM-KS"}
+
+        self.assertEqual([index for index, _name in system_input_devices()], [2, 0, 1])
+
+    def test_recorder_duration_uses_its_actual_sample_rate(self):
+        recorder = Recorder(None, samplerate=48_000, channels=2)
+        recorder.frames_written = 24_000
+        self.assertEqual(recorder.recorded_seconds, 0.5)
+
+    @mock.patch("app.sd.WasapiSettings")
+    @mock.patch("app.sd.check_input_settings")
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_wasapi_capture_enables_format_conversion(
+        self, query_devices, query_hostapis, check_input_settings, wasapi_settings
+    ):
+        query_devices.return_value = {
+            "name": "麦克风阵列",
+            "max_input_channels": 2,
+            "hostapi": 2,
+            "default_samplerate": 48_000,
+        }
+        query_hostapis.return_value = {"name": "Windows WASAPI"}
+        sentinel = object()
+        wasapi_settings.return_value = sentinel
+
+        rate, channels, extra = input_capture_settings(9)
+
+        self.assertEqual((rate, channels, extra), (16_000, 1, sentinel))
+        wasapi_settings.assert_called_once_with(auto_convert=True)
+        check_input_settings.assert_called_once_with(
+            device=9,
+            samplerate=16_000,
+            channels=1,
+            dtype="int16",
+            extra_settings=sentinel,
+        )
+
+    @mock.patch("app.sd.check_input_settings")
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_capture_falls_back_to_native_stereo(self, query_devices, query_hostapis, check_input_settings):
+        query_devices.return_value = {
+            "name": "立体声混音",
+            "max_input_channels": 2,
+            "hostapi": 3,
+            "default_samplerate": 48_000,
+        }
+        query_hostapis.return_value = {"name": "Windows WDM-KS"}
+        check_input_settings.side_effect = [RuntimeError("bad rate"), RuntimeError("bad channels"), None]
+
+        self.assertEqual(input_capture_settings(12), (48_000, 2, None))
+
+
+class AudioMixTest(unittest.TestCase):
+    @staticmethod
+    def _write_pcm(path: Path, rate: int, channels: int, frames: Sequence[tuple[int, ...]]) -> None:
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(channels)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            flattened = [sample for frame in frames for sample in frame]
+            handle.writeframes(struct.pack(f"<{len(flattened)}h", *flattened))
+
+    def test_mixes_mic_and_system_tracks_into_playable_mono_wav(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            mic = root / "mic.wav"
+            system = root / "system.wav"
+            mixed = root / "mixed.wav"
+            self._write_pcm(mic, 8_000, 1, [(1_000,)] * 8_000)
+            self._write_pcm(system, 16_000, 2, [(2_000, 2_000)] * 16_000)
+
+            mix_wav_tracks([mic, system], mixed, output_rate=16_000)
+
+            with wave.open(str(mixed)) as handle:
+                self.assertEqual(handle.getframerate(), 16_000)
+                self.assertEqual(handle.getnchannels(), 1)
+                self.assertEqual(handle.getsampwidth(), 2)
+                self.assertEqual(handle.getnframes(), 16_000)
+                samples = struct.unpack("<16000h", handle.readframes(16_000))
+            self.assertTrue(all(1_490 <= sample <= 1_510 for sample in samples[10:-10]))
+
+    def test_mix_does_not_quiet_the_only_active_track(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            active = root / "active.wav"
+            silent = root / "silent.wav"
+            mixed = root / "mixed.wav"
+            self._write_pcm(active, 16_000, 1, [(1_000,)] * 16_000)
+            self._write_pcm(silent, 16_000, 1, [(0,)] * 16_000)
+
+            mix_wav_tracks([active, silent], mixed)
+
+            with wave.open(str(mixed)) as handle:
+                samples = struct.unpack("<16000h", handle.readframes(16_000))
+            self.assertTrue(all(990 <= sample <= 1_010 for sample in samples))
+
+    def test_mix_offsets_tracks_to_align_different_preroll_lengths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            long_preroll = root / "long-preroll.wav"
+            short_preroll = root / "short-preroll.wav"
+            mixed = root / "mixed.wav"
+            self._write_pcm(
+                long_preroll,
+                8_000,
+                1,
+                [(0,)] * 8_000 + [(1_000,)] * 8_000,
+            )
+            self._write_pcm(short_preroll, 8_000, 1, [(2_000,)] * 8_000)
+
+            mix_wav_tracks(
+                [long_preroll, short_preroll],
+                mixed,
+                output_rate=8_000,
+                start_offsets=[0.0, 1.0],
+            )
+
+            with wave.open(str(mixed)) as handle:
+                first = struct.unpack("<100h", handle.readframes(100))
+                handle.setpos(8_100)
+                aligned = struct.unpack("<100h", handle.readframes(100))
+            self.assertTrue(all(sample == 0 for sample in first))
+            self.assertTrue(all(sample == 1_500 for sample in aligned))
+
+    def test_mix_keeps_longer_track_instead_of_truncating_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            short = root / "short.wav"
+            long = root / "long.wav"
+            mixed = root / "mixed.wav"
+            self._write_pcm(short, 8_000, 1, [(1_000,)] * 4_000)
+            self._write_pcm(long, 8_000, 1, [(2_000,)] * 8_000)
+
+            mix_wav_tracks([short, long], mixed, output_rate=8_000)
+
+            with wave.open(str(mixed)) as handle:
+                self.assertEqual(handle.getnframes(), 8_000)
+                handle.setpos(6_000)
+                tail = struct.unpack("<100h", handle.readframes(100))
+            self.assertTrue(all(sample == 2_000 for sample in tail))
+
+    def test_verifies_playable_wav_duration_and_peak(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "audio.wav"
+            self._write_pcm(path, 8_000, 1, [(1_000,)] * 8_000)
+            duration, peak = verify_wav_file(path, expected_seconds=1.0)
+        self.assertEqual(duration, 1.0)
+        self.assertEqual(peak, 1_000)
+
+    def test_rejects_audio_that_is_much_shorter_than_recording_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "truncated.wav"
+            self._write_pcm(path, 8_000, 1, [(1_000,)] * 8_000)
+            with self.assertRaisesRegex(RuntimeError, "时长异常"):
+                verify_wav_file(path, expected_seconds=10.0)
+
+
+class RecordingPlanTest(unittest.TestCase):
+    def test_stopping_recorders_attempts_every_track_after_one_fails(self):
+        primary = mock.Mock(label="麦克风")
+        primary.stop.side_effect = OSError("disk full")
+        system = mock.Mock(label="系统声音")
+
+        errors = stop_recorders_safely(primary, None, system)
+
+        system.stop.assert_called_once_with()
+        self.assertEqual(errors, ["麦克风：disk full"])
+
+    def test_online_mode_preserves_sources_and_has_a_complete_output(self):
+        root = Path("meeting")
+        self.assertEqual(
+            meeting_audio_paths(root, online=True),
+            {
+                "primary": root / "麦克风录音.wav",
+                "backup": root / "麦克风备份.wav",
+                "system": root / "系统声音.wav",
+                "complete": root / "完整录音.wav",
+            },
+        )
+
+    def test_offline_mode_keeps_original_file_names(self):
+        root = Path("meeting")
+        self.assertEqual(
+            meeting_audio_paths(root, online=False),
+            {
+                "primary": root / "原始录音.wav",
+                "backup": root / "备份录音.wav",
+                "system": None,
+                "complete": root / "原始录音.wav",
+            },
+        )
+
+    def test_chooses_audible_complete_backup_when_primary_stalls(self):
+        primary = cast(Recorder, SimpleNamespace(
+            path=Path("primary.wav"), max_peak=2_000, recorded_seconds=5.0, error=None
+        ))
+        backup = cast(Recorder, SimpleNamespace(
+            path=Path("backup.wav"), max_peak=1_000, recorded_seconds=60.0, error=None
+        ))
+        self.assertEqual(choose_microphone_recording(primary, backup), backup.path)
+
+    def test_keeps_primary_when_backup_is_silent(self):
+        primary = cast(Recorder, SimpleNamespace(
+            path=Path("primary.wav"), max_peak=2_000, recorded_seconds=60.0, error=None
+        ))
+        backup = cast(Recorder, SimpleNamespace(
+            path=Path("backup.wav"), max_peak=0, recorded_seconds=61.0, error=None
+        ))
+        self.assertEqual(choose_microphone_recording(primary, backup), primary.path)
+
+    def test_collects_write_failures_for_prominent_user_warning(self):
+        good = cast(Recorder, SimpleNamespace(label="麦克风", error=None))
+        bad = cast(Recorder, SimpleNamespace(label="系统声音", error="录音落盘失败：disk full"))
+        self.assertEqual(recording_failures(good, None, bad), ["系统声音：录音落盘失败：disk full"])
 
 
 if __name__ == "__main__":
