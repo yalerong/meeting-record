@@ -194,10 +194,11 @@ class WavWriterTest(unittest.TestCase):
         self.assertEqual(recorder.live_started_at, 499.5)
         self.assertEqual(getattr(recorder, "last_capture_ended_at", None), 499.7)
 
-    def test_callback_ignores_adc_timestamps_without_a_lead(self):
-        # MME and DirectSound report inputBufferAdcTime == currentTime (or both zero).
+    def test_callback_ignores_adc_timestamps_without_a_usable_lead(self):
+        # MME/DirectSound report inputBufferAdcTime == currentTime (or both zero);
+        # WDM-KS reports a stream-relative adc (about 0) against an absolute currentTime.
         recorder = Recorder(None, samplerate=10)
-        for adc, current in ((0.0, 0.0), (10.5, 10.5)):
+        for adc, current in ((0.0, 0.0), (10.5, 10.5), (-0.12, 188_473.7), (0.05, 188_473.7)):
             recorder.live_started_at = 0.0
             with mock.patch("app.time.monotonic", return_value=500.0):
                 recorder._callback(
@@ -207,6 +208,42 @@ class WavWriterTest(unittest.TestCase):
                     SimpleNamespace(input_overflow=False),
                 )
             self.assertAlmostEqual(recorder.live_started_at, 499.8)
+
+    def test_stop_pads_a_trailing_capture_gap(self):
+        # A loopback endpoint stops calling back when nothing plays; the tail must still
+        # be represented so the track spans the session.
+        recorder = Recorder(None, samplerate=10)
+        with mock.patch("app.time.monotonic", return_value=100.2):
+            recorder._callback(
+                bytearray(struct.pack("<2h", 100, 200)), 2, None, SimpleNamespace(input_overflow=False)
+            )
+        with mock.patch("app.time.monotonic", return_value=103.2):
+            recorder.stop()
+
+        queued = list(recorder._queue.queue)
+        self.assertEqual(queued, [struct.pack("<2h", 100, 200), bytes(30 * 2), None])
+        self.assertAlmostEqual(recorder.padded_seconds, 3.0)
+
+    def test_stop_does_not_pad_a_normal_tail(self):
+        recorder = Recorder(None, samplerate=10)
+        with mock.patch("app.time.monotonic", return_value=100.2):
+            recorder._callback(
+                bytearray(struct.pack("<2h", 100, 200)), 2, None, SimpleNamespace(input_overflow=False)
+            )
+        with mock.patch("app.time.monotonic", return_value=100.3):
+            recorder.stop()
+
+        self.assertEqual(list(recorder._queue.queue), [struct.pack("<2h", 100, 200), None])
+
+    @mock.patch("app.sd.RawInputStream")
+    def test_loopback_recorder_does_not_restart_on_idle(self, _stream):
+        recorder = Recorder(None, restart_on_stall=False)
+        recorder.last_data_at = 100.0
+        with mock.patch("app.time.monotonic", return_value=110.0), mock.patch.object(
+            recorder, "_restart_stream"
+        ) as restart, mock.patch.object(recorder._stopping, "wait", side_effect=[False, True]):
+            recorder._watch()
+        restart.assert_not_called()
 
     @mock.patch("app.sd.RawInputStream")
     def test_watchdog_retries_after_a_failed_reopen(self, stream_cls):

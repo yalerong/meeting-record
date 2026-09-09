@@ -46,6 +46,7 @@ SILENCE_WARN_SEC = 15.0
 STALL_RESTART_SEC = 2.0
 STALL_WARN_SEC = 3.0
 GAP_PAD_MIN_SEC = 0.5  # capture gaps at least this long are padded with silence to keep the timeline
+MAX_ADC_LEAD_SEC = 1.0  # a plausible PortAudio input latency; anything else is a host-API quirk
 FLUSH_INTERVAL_SEC = 5.0
 PREROLL_SEC = 30.0
 MIN_FREE_BYTES = 2 * 1024 ** 3
@@ -662,8 +663,12 @@ class Recorder:
         preroll: bytes = b"",
         preroll_ended_at: float = 0.0,
         label: str = "主录音",
+        restart_on_stall: bool = True,
     ):
         self.path = path
+        # Render-loopback endpoints (立体声混音 / WDM-KS speakers) deliver no callbacks while
+        # nothing is playing, so remote silence must not be mistaken for a dead device.
+        self.restart_on_stall = restart_on_stall
         self.device = device
         self.extra_settings = extra_settings
         self.samplerate = samplerate
@@ -778,11 +783,13 @@ class Recorder:
             callback_time = float(time_info.currentTime)
             if not math.isfinite(adc_time) or not math.isfinite(callback_time):
                 raise ValueError("invalid PortAudio capture timestamp")
-            if callback_time - adc_time <= 0:
-                # MME/DirectSound hand back adc == current (or both zero): no real lead,
-                # so the block-length fallback is the better estimate of the block start.
-                raise ValueError("PortAudio capture timestamp carries no ADC lead")
-            block_started_at = captured_at + adc_time - callback_time
+            lead = callback_time - adc_time
+            if not 0 < lead <= MAX_ADC_LEAD_SEC:
+                # MME/DirectSound hand back adc == current (or both zero); WDM-KS reports a
+                # stream-relative adc against an absolute currentTime. Neither is a usable
+                # lead, so the block-length fallback is the better estimate of the block start.
+                raise ValueError("PortAudio capture timestamp carries no usable ADC lead")
+            block_started_at = captured_at - lead
         except (AttributeError, TypeError, ValueError):
             block_started_at = captured_at - block_seconds
         previous_end = self.last_capture_ended_at
@@ -869,7 +876,7 @@ class Recorder:
         while not self._stopping.wait(0.5):
             # Also retry when a previous reopen failed and left no stream: an unplugged
             # device usually comes back, and the callback pads the gap once it does.
-            if self.idle_seconds > STALL_RESTART_SEC:
+            if self.restart_on_stall and self.idle_seconds > STALL_RESTART_SEC:
                 self._restart_stream()
 
     def _restart_stream(self) -> None:
@@ -918,6 +925,16 @@ class Recorder:
         if self._watchdog is not None:
             self._watchdog.join(timeout=3)
             self._watchdog = None
+        # No more callbacks can arrive now. If the last block ended well before stop()
+        # (a loopback endpoint idle at the end of the meeting), pad the tail so the file
+        # spans the whole session and later alignment/verification stay honest.
+        if self.live_started_at and self.last_capture_ended_at:
+            gap = self.stopped_at - self.last_capture_ended_at
+            if gap >= GAP_PAD_MIN_SEC:
+                gap_frames = round(gap * self.samplerate)
+                self._queue.put(bytes(gap_frames * SAMPLE_WIDTH))
+                self.padded_seconds += gap_frames / self.samplerate
+                self._note(f"[{timestamp(self.recorded_seconds)}] 结束前约 {gap:.1f} 秒没有采到数据，已用静音补齐")
         self._queue.put(None)
         if self._consumer is not None:
             self._consumer.join(timeout=15)
@@ -1348,6 +1365,7 @@ class MeetingApp(tk.Tk):
                     channels=channels,
                     keep_preroll=True,
                     label="系统声音试音",
+                    restart_on_stall=False,
                 )
                 system_monitor.start()
             except Exception as error:
@@ -1463,8 +1481,8 @@ class MeetingApp(tk.Tk):
             )
         elif system is not None and system.idle_seconds > STALL_WARN_SEC:
             self.level_hint.config(
-                text=f"⚠ 电脑系统声音已 {system.idle_seconds:.0f} 秒没有送来数据，正在自动重连。",
-                foreground="#c00000",
+                text=f"电脑系统声音已 {system.idle_seconds:.0f} 秒没有数据（对方静音时属正常；空档会自动补静音）。",
+                foreground="#806000",
             )
         elif (
             system is not None
@@ -1588,6 +1606,7 @@ class MeetingApp(tk.Tk):
                     preroll=system_preroll,
                     preroll_ended_at=system_preroll_ended_at,
                     label="系统声音",
+                    restart_on_stall=False,
                 )
                 system_recorder.start()
         except Exception as error:
