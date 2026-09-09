@@ -25,7 +25,8 @@ def fetch(url: str, dest: Path) -> None:
         print(f"已存在，跳过：{dest.name}")
         return
     print(f"下载 {dest.name} ……")
-    urllib.request.urlretrieve(url, dest)
+    # Callers pass only the fixed HTTPS model URLs declared in this file.
+    urllib.request.urlretrieve(url, dest)  # nosec B310
     print(f"  完成 {dest.stat().st_size / 1e6:.1f} MB")
 
 
