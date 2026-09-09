@@ -45,6 +45,7 @@ MAX_BOOST = 20.0
 SILENCE_WARN_SEC = 15.0
 STALL_RESTART_SEC = 2.0
 STALL_WARN_SEC = 3.0
+GAP_PAD_MIN_SEC = 0.5  # capture gaps at least this long are padded with silence to keep the timeline
 FLUSH_INTERVAL_SEC = 5.0
 PREROLL_SEC = 30.0
 MIN_FREE_BYTES = 2 * 1024 ** 3
@@ -666,6 +667,7 @@ class Recorder:
         self.capture_error: str | None = None
         self.write_error: str | None = None
         self.stalled_seconds = 0.0
+        self.padded_seconds = 0.0
         self.events: list[str] = []
         self.last_data_at = 0.0
         self.last_capture_ended_at = 0.0
@@ -682,11 +684,9 @@ class Recorder:
     @property
     def error(self) -> str | None:
         # A recovered capture stall must never hide a file that stopped being written.
-        if self.stalled_seconds > 0:
-            gap_error = f"录音采集曾中断，时间轴丢失约 {self.stalled_seconds:.1f} 秒"
-        else:
-            gap_error = None
-        return self.write_error or self.capture_error or gap_error
+        # Recovered gaps are padded with silence in _callback, so they keep the timeline
+        # intact; a gap the stream never recovered from shows up as a short WAV instead.
+        return self.write_error or self.capture_error
 
     @property
     def recorded_seconds(self) -> float:
@@ -757,6 +757,7 @@ class Recorder:
             block_started_at = captured_at + adc_time - callback_time
         except (AttributeError, TypeError, ValueError):
             block_started_at = captured_at - block_seconds
+        previous_end = self.last_capture_ended_at
         self.last_capture_ended_at = block_started_at + block_seconds
         if not self.live_started_at:
             self.live_started_at = block_started_at
@@ -767,6 +768,14 @@ class Recorder:
                     self._queue.put(bytes(gap_frames * SAMPLE_WIDTH))
             else:
                 self.audio_started_at = self.live_started_at
+        elif previous_end and block_started_at - previous_end >= GAP_PAD_MIN_SEC:
+            # The stream stalled (typically a watchdog restart) and came back: fill the
+            # uncaptured interval with silence so later speech keeps its true position.
+            gap_frames = round((block_started_at - previous_end) * self.samplerate)
+            self._queue.put(bytes(gap_frames * SAMPLE_WIDTH))
+            gap_seconds = gap_frames / self.samplerate
+            self.padded_seconds += gap_seconds
+            self._note(f"[{timestamp(self.recorded_seconds)}] 采集中断约 {gap_seconds:.1f} 秒，已用静音补齐以保持时间轴")
         self._queue.put(downmix_to_mono(bytes(indata), self.channels))
 
     def _consume(self) -> None:
@@ -1032,12 +1041,19 @@ def wasapi_index() -> int | None:
     return None
 
 
-def backup_candidates(primary: int | None) -> list[tuple[int, object | None]]:
+def backup_candidates(primary: int | None, exclude: int | None = None) -> list[tuple[int, object | None]]:
+    """Rank microphone backup devices; ``exclude`` is the selected system-audio endpoint.
+
+    System endpoints are usually recognised by name, but a virtual cable can carry
+    system audio under any name, so the chosen one is also excluded by identity
+    (its index and every host-API alias sharing its name).
+    """
     try:
         devices = sd.query_devices()
         primary_index = sd.default.device[0] if primary is None else primary
         primary_name = devices[primary_index]["name"].strip()
         primary_api = devices[primary_index]["hostapi"]
+        excluded_name = devices[exclude]["name"].strip() if exclude is not None else None
     except Exception:
         return []
     wasapi = wasapi_index()
@@ -1046,6 +1062,8 @@ def backup_candidates(primary: int | None) -> list[tuple[int, object | None]]:
         if (
             device["max_input_channels"] <= 0
             or index == primary_index
+            or index == exclude
+            or device["name"].strip() == excluded_name
             or is_system_audio_input(device["name"])
         ):
             continue
@@ -1460,8 +1478,8 @@ class MeetingApp(tk.Tk):
         except Exception:
             return b"", 0.0
 
-    def _start_backup(self, primary: int | None, backup_path: Path) -> Recorder | None:
-        for index, _candidate_extra in backup_candidates(primary):
+    def _start_backup(self, primary: int | None, backup_path: Path, exclude: int | None = None) -> Recorder | None:
+        for index, _candidate_extra in backup_candidates(primary, exclude):
             try:
                 rate, channels, extra = input_capture_settings(index)
                 recorder = Recorder(
@@ -1485,6 +1503,7 @@ class MeetingApp(tk.Tk):
     def start_recording(self) -> None:
         recorder: Recorder | None = None
         system_recorder: Recorder | None = None
+        system_device: int | None = None
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(OUTPUT_DIR).free
@@ -1560,7 +1579,7 @@ class MeetingApp(tk.Tk):
 
         self.recorder = recorder
         self.system_recorder = system_recorder
-        self.backup = self._start_backup(device, backup_path)
+        self.backup = self._start_backup(device, backup_path, exclude=system_device)
         self._silence_since = None
         self._system_silence_since = None
         self._silence_warned = False

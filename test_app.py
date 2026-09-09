@@ -125,12 +125,41 @@ class WavWriterTest(unittest.TestCase):
         with mock.patch("app.time.monotonic", return_value=111.5):
             self.assertEqual(recorder.expected_seconds, 15.5)
 
-    def test_expected_seconds_includes_time_lost_to_device_reconnects(self):
+    def test_expected_seconds_keeps_time_lost_to_device_reconnects(self):
+        # A recovered stall is padded with silence, so the file must still span the gap.
         recorder = Recorder(None)
         recorder.started_at = 100.0
         recorder.stalled_seconds = 3.0
         with mock.patch("app.time.monotonic", return_value=111.5):
             self.assertEqual(recorder.expected_seconds, 11.5)
+
+    def test_callback_pads_a_recovered_capture_gap_with_silence(self):
+        recorder = Recorder(None, samplerate=10)
+        block = bytearray(struct.pack("<2h", 100, 200))
+        status = SimpleNamespace(input_overflow=False)
+        with mock.patch("app.time.monotonic", return_value=100.2):
+            recorder._callback(block, 2, None, status)
+        # Next block starts 3 s after the previous one ended: a watchdog restart happened.
+        with mock.patch("app.time.monotonic", return_value=103.4):
+            recorder._callback(block, 2, None, status)
+
+        queued = list(recorder._queue.queue)
+        self.assertEqual(queued, [bytes(block), bytes(30 * 2), bytes(block)])
+        self.assertAlmostEqual(recorder.padded_seconds, 3.0)
+        self.assertIsNone(recorder.error)
+        self.assertTrue(any("静音补齐" in event for event in recorder.events))
+
+    def test_callback_does_not_pad_ordinary_scheduling_jitter(self):
+        recorder = Recorder(None, samplerate=10)
+        block = bytearray(struct.pack("<2h", 100, 200))
+        status = SimpleNamespace(input_overflow=False)
+        with mock.patch("app.time.monotonic", return_value=100.2):
+            recorder._callback(block, 2, None, status)
+        with mock.patch("app.time.monotonic", return_value=100.6):
+            recorder._callback(block, 2, None, status)
+
+        self.assertEqual(list(recorder._queue.queue), [bytes(block), bytes(block)])
+        self.assertEqual(recorder.padded_seconds, 0.0)
 
     def test_preroll_handoff_inserts_the_uncaptured_gap(self):
         recorder = Recorder(None, samplerate=10, preroll=struct.pack("<10h", *range(10)))
@@ -179,7 +208,8 @@ class WavWriterTest(unittest.TestCase):
         self.assertEqual(recorder.stalled_seconds, 4.0)
 
     @mock.patch("app.sd.RawInputStream")
-    def test_recovered_stream_gap_remains_a_recording_error(self, _stream):
+    def test_recovered_stream_gap_is_not_a_recording_error(self, _stream):
+        # The gap is padded with silence by the next callback, so processing may continue.
         recorder = Recorder(Path("unused.wav"))
         recorder.last_data_at = 100.0
 
@@ -188,7 +218,8 @@ class WavWriterTest(unittest.TestCase):
 
         self.assertEqual(recorder.restarts, 1)
         self.assertIsNone(recorder.capture_error)
-        self.assertIn("丢失", recorder.error or "")
+        self.assertIsNone(recorder.error)
+        self.assertEqual(recorder.stalled_seconds, 4.0)
 
     def test_consumer_finalizes_writer_when_it_exits(self):
         recorder = Recorder(Path("unused.wav"))
@@ -304,6 +335,30 @@ class AudioSourceTest(unittest.TestCase):
             candidates = backup_candidates(0)
 
         self.assertEqual([index for index, _extra in candidates], [2])
+
+    @mock.patch("app.sd.WasapiSettings")
+    @mock.patch("app.sd.query_hostapis")
+    @mock.patch("app.sd.query_devices")
+    def test_microphone_backup_candidates_exclude_the_selected_system_endpoint(
+        self, query_devices, query_hostapis, _wasapi_settings
+    ):
+        # A virtual cable carries system audio under a name the hint list does not know.
+        devices = [
+            {"name": "Microphone", "hostapi": 0, "max_input_channels": 1},
+            {"name": "CABLE Output", "hostapi": 0, "max_input_channels": 2},
+            {"name": "CABLE Output", "hostapi": 1, "max_input_channels": 2},
+            {"name": "USB Microphone", "hostapi": 1, "max_input_channels": 1},
+        ]
+        query_devices.side_effect = lambda index=None: devices if index is None else devices[index]
+        query_hostapis.side_effect = lambda index=None: (
+            [{"name": "MME"}, {"name": "Windows WASAPI"}]
+            if index is None
+            else [{"name": "MME"}, {"name": "Windows WASAPI"}][index]
+        )
+        with mock.patch.object(type(__import__("app").sd.default), "device", (0, 0)):
+            candidates = backup_candidates(0, exclude=2)
+
+        self.assertEqual([index for index, _extra in candidates], [3])
 
     @mock.patch("app.sd.query_hostapis")
     @mock.patch("app.sd.query_devices")
