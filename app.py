@@ -176,15 +176,34 @@ def _resampled_mono_block(
         return result
 
     valid_positions = positions[valid]
-    source_start = int(numpy.floor(valid_positions[0]))
-    source_stop = min(source_frames, int(numpy.floor(valid_positions[-1])) + 2)
+    taps = _antialias_taps(source_rate, output_rate)
+    margin = len(taps) // 2 if taps is not None else 0
+    source_start = max(0, int(numpy.floor(valid_positions[0])) - margin)
+    source_stop = min(source_frames, int(numpy.floor(valid_positions[-1])) + 2 + margin)
     handle.setpos(source_start)
     raw = handle.readframes(source_stop - source_start)
     samples = numpy.frombuffer(raw, dtype="<i2").reshape(-1, source_channels)
     mono = samples.astype(numpy.float64).mean(axis=1)
+    if taps is not None:
+        # Linear interpolation alone folds everything above the output Nyquist back
+        # into the speech band; low-pass first (windowed sinc, symmetric, zero phase).
+        mono = numpy.convolve(mono, taps, mode="same")
     source_axis: Any = numpy.arange(source_start, source_start + len(mono), dtype=numpy.float64)
     result[valid] = numpy.interp(valid_positions, source_axis, mono)
     return result
+
+
+def _antialias_taps(source_rate: int, output_rate: int):
+    """Windowed-sinc low-pass for decimation, or ``None`` when no band limiting is needed."""
+    import numpy
+
+    if source_rate <= output_rate:
+        return None
+    half = 48
+    cutoff = 0.45 * output_rate / source_rate  # cycles per source sample, below output Nyquist
+    n = numpy.arange(-half, half + 1, dtype=numpy.float64)
+    taps = 2 * cutoff * numpy.sinc(2 * cutoff * n) * numpy.hamming(len(n))
+    return taps / taps.sum()
 
 
 def mix_wav_tracks(
@@ -723,10 +742,15 @@ class Recorder:
         except Exception:
             self._stopping.set()
             self._queue.put(None)
-            if self._writer is not None:
-                self._writer.close()
-                self._writer = None
+            # The consumer finalizes the writer in its own finally block; closing it here
+            # too would race that thread on the same file handle and can leave the file
+            # locked when the next backup candidate reopens the same path.
+            self._consumer.join(timeout=5)
+            self._consumer = None
             raise
+        # Slow devices (Bluetooth, some USB mics) take a while to deliver the first block;
+        # the stall budget starts once the stream is actually open, not at construction.
+        self.last_data_at = time.monotonic()
         self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._watchdog.start()
 
@@ -754,6 +778,10 @@ class Recorder:
             callback_time = float(time_info.currentTime)
             if not math.isfinite(adc_time) or not math.isfinite(callback_time):
                 raise ValueError("invalid PortAudio capture timestamp")
+            if callback_time - adc_time <= 0:
+                # MME/DirectSound hand back adc == current (or both zero): no real lead,
+                # so the block-length fallback is the better estimate of the block start.
+                raise ValueError("PortAudio capture timestamp carries no ADC lead")
             block_started_at = captured_at + adc_time - callback_time
         except (AttributeError, TypeError, ValueError):
             block_started_at = captured_at - block_seconds
@@ -839,7 +867,9 @@ class Recorder:
 
     def _watch(self) -> None:
         while not self._stopping.wait(0.5):
-            if self._stream is not None and self.idle_seconds > STALL_RESTART_SEC:
+            # Also retry when a previous reopen failed and left no stream: an unplugged
+            # device usually comes back, and the callback pads the gap once it does.
+            if self.idle_seconds > STALL_RESTART_SEC:
                 self._restart_stream()
 
     def _restart_stream(self) -> None:

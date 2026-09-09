@@ -11,6 +11,7 @@ from unittest import mock
 
 from app import (
     MAX_WAV_DATA_BYTES,
+    STALL_RESTART_SEC,
     MeetingApp,
     SYSTEM_AUDIO_UNRECOGNISED_SUFFIX,
     WavWriter,
@@ -192,6 +193,54 @@ class WavWriterTest(unittest.TestCase):
         self.assertEqual(recorder.last_data_at, 500.0)
         self.assertEqual(recorder.live_started_at, 499.5)
         self.assertEqual(getattr(recorder, "last_capture_ended_at", None), 499.7)
+
+    def test_callback_ignores_adc_timestamps_without_a_lead(self):
+        # MME and DirectSound report inputBufferAdcTime == currentTime (or both zero).
+        recorder = Recorder(None, samplerate=10)
+        for adc, current in ((0.0, 0.0), (10.5, 10.5)):
+            recorder.live_started_at = 0.0
+            with mock.patch("app.time.monotonic", return_value=500.0):
+                recorder._callback(
+                    bytearray(struct.pack("<2h", 100, 200)),
+                    2,
+                    SimpleNamespace(inputBufferAdcTime=adc, currentTime=current),
+                    SimpleNamespace(input_overflow=False),
+                )
+            self.assertAlmostEqual(recorder.live_started_at, 499.8)
+
+    @mock.patch("app.sd.RawInputStream")
+    def test_watchdog_retries_after_a_failed_reopen(self, stream_cls):
+        recorder = Recorder(Path("unused.wav"))
+        recorder.last_data_at = 100.0
+        stream_cls.side_effect = [RuntimeError("device gone"), mock.Mock()]
+
+        with mock.patch("app.time.monotonic", return_value=104.0):
+            recorder._restart_stream()
+        self.assertIsNone(recorder._stream)
+        self.assertIsNotNone(recorder.capture_error)
+
+        # The watchdog condition must not require an open stream to try again.
+        with mock.patch("app.time.monotonic", return_value=108.0):
+            self.assertGreater(recorder.idle_seconds, STALL_RESTART_SEC)
+            recorder._restart_stream()
+        self.assertIsNotNone(recorder._stream)
+        self.assertIsNone(recorder.capture_error)
+        self.assertEqual(recorder.restarts, 1)
+
+    @mock.patch("app.sd.RawInputStream")
+    def test_start_failure_lets_the_consumer_finalize_the_writer(self, stream_cls):
+        stream_cls.side_effect = RuntimeError("cannot open")
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "backup.wav"
+        recorder = Recorder(path)
+
+        with self.assertRaises(RuntimeError):
+            recorder.start()
+
+        self.assertIsNone(recorder._writer)
+        self.assertIsNone(recorder._consumer)
+        # The file is closed and can be reopened by the next backup candidate.
+        with open(path, "wb"):
+            pass
 
     @mock.patch("app.sd.RawInputStream")
     def test_stream_reconnect_keeps_write_error_visible(self, _stream):
@@ -633,6 +682,31 @@ class AudioMixTest(unittest.TestCase):
                 self.assertEqual((handle.getframerate(), handle.getnchannels(), handle.getnframes()), (16_000, 1, 16_000))
                 samples = struct.unpack("<16000h", handle.readframes(16_000))
             self.assertTrue(all(1_990 <= sample <= 2_010 for sample in samples[10:-10]))
+
+    def test_downsampling_removes_content_above_the_output_nyquist(self):
+        # 48 kHz source with a 1 kHz tone (must survive) plus a 20 kHz tone (must not
+        # alias back into the 16 kHz output as a 4 kHz tone).
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            native = root / "native.wav"
+            mixed = root / "mixed.wav"
+            frames = [
+                (int(8_000 * math.sin(2 * math.pi * 1_000 * i / 48_000) + 8_000 * math.sin(2 * math.pi * 20_000 * i / 48_000)),)
+                for i in range(48_000)
+            ]
+            self._write_pcm(native, 48_000, 1, frames)
+            mix_wav_tracks([native], mixed)
+            with wave.open(str(mixed)) as handle:
+                self.assertEqual(handle.getframerate(), 16_000)
+                samples = struct.unpack("<16000h", handle.readframes(16_000))
+            body = samples[200:-200]
+            n = len(body)
+            def amplitude(freq: int) -> float:
+                re = sum(v * math.cos(2 * math.pi * freq * i / 16_000) for i, v in enumerate(body))
+                im = sum(v * math.sin(2 * math.pi * freq * i / 16_000) for i, v in enumerate(body))
+                return 2 * math.hypot(re, im) / n
+            self.assertGreater(amplitude(1_000), 7_000)
+            self.assertLess(amplitude(4_000), 400)
 
     def test_rejects_audio_that_is_much_shorter_than_recording_session(self):
         with tempfile.TemporaryDirectory() as folder:
