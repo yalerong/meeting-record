@@ -1,5 +1,53 @@
 # 会议录音与纪要
 
+## Windows 中控台版
+
+发行包为 `MeetingRecord-windows-x64.zip`。解压整个压缩包后，双击
+`MeetingRecord/MeetingRecord.exe` 打开中控台，无需安装 Python。
+请保留同目录的 `_internal` 文件夹，不要单独复制 EXE。
+
+- **当前会议**：试音、录音、实时电平、处理阶段和耗时；会后转写与纪要生成时显示文字预览及运行事件。
+- **环境准备**：检查麦克风、系统声音、模型、本地 Ollama 和可用空间；提供模型下载及 Ollama 启动入口。
+- **历史记录**：查看完成、失败、停止或异常中断的任务，打开结果并重新处理。重新处理使用新的结果目录，不覆盖旧结果。
+
+首次使用请到“环境准备”下载转写模型（约 1.6GB）。说话人模型是可选的；
+要生成 AI 纪要，还需安装 Ollama，并在界面点击“准备纪要模型”。缺少 Ollama
+或纪要生成失败时会明确标记为简易兜底版。模型准备完成后，会议处理可以离线运行。
+转写模型没有准备好时仍能保存录音，随后可从历史记录重新处理。
+
+录音、任务记录、模型、配置和日志统一保存在：
+
+```text
+%LOCALAPPDATA%\MeetingRecord\
+    meetings\
+    models\
+    logs\app.log
+    config.json
+```
+
+“环境准备 → 打开数据目录”可直接访问。不向 EXE 安装目录或解包临时目录写入用户数据。
+升级或删除程序文件不影响上述数据。开发与自动化验收可用 `MEETING_RECORD_HOME`
+指定独立数据目录。旧版项目中的 `meetings/` 不会移动，可通过“处理已有录音”选择旧 WAV。
+
+保存与混音在后台执行，关闭时会等待保存完成。停止处理会保留已写入的逐字稿；
+转写在当前计算段返回后停止，说话人分离在进度回调处停止，纪要在下一条流式输出或
+30 秒读取超时后停止。转写模型下载器不支持中途取消，取消在当前下载调用返回后生效。
+界面会说明等待状态。程序意外结束后，历史任务会标记为“意外中断”，可重新处理原录音。
+
+构建与验证（Windows 64 位，推荐 Python 3.12）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+# 产物：dist\MeetingRecord\MeetingRecord.exe 和 dist\MeetingRecord-windows-x64.zip
+# 已安装依赖的开发环境可执行：
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -v
+.\.venv\Scripts\python.exe -X utf8 -m ruff check --isolated --select E4,E7,E9,F .
+```
+
+打包检查包括真实 Windows GUI EXE、PortAudio DLL、Whisper VAD、Sherpa 原生库和
+不包含开发者录音/模型。内部诊断命令 `MeetingRecord.exe --diagnostics-file <json路径>`
+只检查运行库导入和数据目录，不启动录音。硬件录音仍须按本文后面的验收步骤检查。
+
 这是一个仅在本机运行的 Windows 小程序：
 
 1. 支持两种会议：**线下会议录麦克风**；**线上会议同时录麦克风和电脑系统声音**。
@@ -11,7 +59,7 @@
 
 ## 使用
 
-第一次使用先双击 `setup.bat` 安装独立运行环境，以后双击 `start.bat`。
+使用发行包时双击 `MeetingRecord.exe`。使用源码时，先双击 `setup.bat` 安装独立运行环境，以后双击 `start.bat`。
 
 - **线下会议**：选择“线下会议（麦克风）”，说一句话，确认麦克风电平明显跳动。
 - **线上会议**：选择“线上会议（麦克风 + 电脑声音）”，先自己说一句话，再播放一段视频或让远端参会者说话，必须确认“麦克风电平”和“系统声电平”都会动。
@@ -26,7 +74,7 @@
 
 程序崩溃、断电或当时没处理完的录音，用 **“处理已有录音…”** 选择 `原始录音.wav`、`完整录音.wav` 或任意保留下来的原轨即可重新处理，不用重录。
 
-结果保存在 `meetings/<日期时间-会议名称>/`。
+结果保存在 `%LOCALAPPDATA%/MeetingRecord/meetings/` 下的独立任务目录，界面可直接打开。
 
 线下会议：
 
@@ -138,7 +186,7 @@ ollama pull qwen2.5:7b        # 最终合并用
 ollama pull qwen2.5:3b        # 可选：长会议的分段摘要用它，省一半时间
 ```
 
-转写模型 `large-v3-turbo` 首次运行时自动下载（约 1.6GB）。
+转写模型 `large-v3-turbo` 在“环境准备”页下载（约 1.6GB），下载完成后处理阶段只加载本地文件。
 
 ## 速度参考
 

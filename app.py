@@ -3,7 +3,10 @@ from __future__ import annotations
 import collections
 import ctypes
 import gc
+import hashlib
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import queue
@@ -12,9 +15,11 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,12 +29,18 @@ from urllib import request
 
 import sounddevice as sd
 
+from console_support import TaskStore, get_app_paths, load_json, save_json
+from environment_setup import (
+    SetupCancelled, ollama_pull, prepare_whisper, whisper_model_dir, whisper_ready,
+)
+
 
 APP_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = APP_DIR / "meetings"
-MODELS_DIR = APP_DIR / "models"
-SEGMENTATION_MODEL = MODELS_DIR / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
-EMBEDDING_MODEL = MODELS_DIR / "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
+PATHS = get_app_paths(APP_DIR)
+OUTPUT_DIR = PATHS.meetings_dir
+MODELS_DIR = PATHS.models_dir
+SEGMENTATION_MODEL = PATHS.model_path("sherpa-onnx-pyannote-segmentation-3-0/model.onnx")
+EMBEDDING_MODEL = PATHS.model_path("3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx")
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
@@ -492,12 +503,25 @@ def pick_chunk_model() -> str:
         return OLLAMA_MODEL
 
 
-def run_ollama(prompt: str, max_tokens: int = 900, model: str = "") -> str:
+class ProcessingCancelled(RuntimeError):
+    pass
+
+
+def check_cancel(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise ProcessingCancelled("处理已停止，已有文件已保留。")
+
+
+def run_ollama(
+    prompt: str, max_tokens: int = 900, model: str = "", *,
+    cancel: threading.Event | None = None, on_text=None,
+) -> str:
+    check_cancel(cancel)
     payload = json.dumps(
         {
             "model": model or OLLAMA_MODEL,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,
             "keep_alive": "10m",
             "options": {"temperature": 0.1, "num_predict": max_tokens},
         }
@@ -510,11 +534,34 @@ def run_ollama(prompt: str, max_tokens: int = 900, model: str = "") -> str:
     )
     try:
         # api_request always targets the fixed loopback-only URL above.
-        with request.urlopen(api_request, timeout=600) as response:  # nosec B310
-            result = json.loads(response.read().decode("utf-8"))
+        pieces = []
+        done = False
+        # A stalled local service must not leave cancellation waiting for ten minutes.
+        with request.urlopen(api_request, timeout=30) as response:  # nosec B310
+            for raw in response:
+                check_cancel(cancel)
+                if not raw.strip():
+                    continue
+                result = json.loads(raw.decode("utf-8"))
+                if result.get("error"):
+                    raise RuntimeError(result["error"])
+                piece = result.get("response", "")
+                if piece:
+                    pieces.append(piece)
+                    if on_text is not None:
+                        on_text(piece)
+                if result.get("done"):
+                    done = True
+                    break
+        check_cancel(cancel)
+        if not done:
+            raise RuntimeError("生成流中断，未收到完成标记")
+    except ProcessingCancelled:
+        raise
     except Exception as error:
+        check_cancel(cancel)
         raise RuntimeError(f"Ollama（{model or OLLAMA_MODEL}）调用失败：{error}") from error
-    output = result.get("response", "").strip()
+    output = "".join(pieces).strip()
     if not output:
         raise RuntimeError(result.get("error") or "Ollama 没有返回内容")
     return output
@@ -545,7 +592,10 @@ def generate_minutes(
     quality: str = "未提供",
     speakers: int = 0,
     progress=None,
+    cancel: threading.Event | None = None,
+    on_text=None,
 ) -> str:
+    check_cancel(cancel)
     speaker_rule = (
         f"逐字稿里的“说话人1…说话人{speakers}”是机器自动分离的结果，可能分错或把两个人并成一个。"
         "可以用它区分谁说了什么，但绝不能推断他们的真实姓名、职务或所属部门；"
@@ -560,6 +610,7 @@ def generate_minutes(
     else:
         chunk_notes: list[str] = []
         for index, chunk in enumerate(chunks, start=1):
+            check_cancel(cancel)
             prompt = f"""你是一名严谨的中文会议秘书。下面是带时间戳的会议逐字稿第 {index}/{len(chunks)} 部分。
 整份转写的质量评估为：{quality}。
 {speaker_rule}只允许提取逐字稿明确表达的事实。不得猜测或补充人物身份、业务背景、金额含义、系统全称、决定、负责人或期限。
@@ -572,7 +623,9 @@ def generate_minutes(
 """
             if progress is not None:
                 progress(index, len(chunks) + 1)
-            chunk_notes.append(run_ollama(prompt, max_tokens=1_200, model=chunk_model))
+            chunk_notes.append(run_ollama(
+                prompt, max_tokens=1_200, model=chunk_model, cancel=cancel, on_text=on_text,
+            ))
         combined = "\n\n".join(
             f"### 分段记录 {index}\n{note}"
             for index, note in enumerate(chunk_notes, start=1)
@@ -591,11 +644,15 @@ def generate_minutes(
 分段记录：
 {combined}
 """
+    check_cancel(cancel)
     if chunk_model != OLLAMA_MODEL:
         stop_ollama_model(chunk_model)
     if progress is not None:
         progress(len(chunks) + 1, len(chunks) + 1)
-    minutes = clean_markdown(run_ollama(final_prompt, max_tokens=3_000, model=OLLAMA_MODEL))
+    minutes = clean_markdown(run_ollama(
+        final_prompt, max_tokens=3_000, model=OLLAMA_MODEL, cancel=cancel, on_text=on_text,
+    ))
+    check_cancel(cancel)
     metadata = (
         f"<!-- 本地生成；音频未上传 -->\n"
         f"- 会议时间：{datetime.now():%Y-%m-%d %H:%M}\n"
@@ -1130,9 +1187,27 @@ def backup_candidates(primary: int | None, exclude: int | None = None) -> list[t
 class MeetingApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("会议录音与纪要（高质量本地版）")
-        self.geometry("720x650")
-        self.minsize(700, 630)
+        self.title("会议录音中控台")
+        self.geometry("1180x820")
+        self.minsize(1040, 740)
+        self._events: queue.Queue = queue.Queue()
+        self._closing = False
+        self._close_when_idle = False
+        self.saving = False
+        self._setup_busy = False
+        self._setup_cancel = threading.Event()
+        self._checking_environment = False
+        self._task_started = 0.0
+        self._task_state = "idle"
+        self.tasks = TaskStore(OUTPUT_DIR)
+        recovered = self.tasks.recover_interrupted()
+        try:
+            self.settings = load_json(PATHS.config_path, {})
+            if not isinstance(self.settings, dict):
+                self.settings = {}
+        except (OSError, ValueError):
+            logging.exception("Cannot read settings")
+            self.settings = {}
         self.recorder: Recorder | None = None
         self.backup: Recorder | None = None
         self.monitor: Recorder | None = None
@@ -1144,7 +1219,7 @@ class MeetingApp(tk.Tk):
         self.processing = False
         self.devices: list[tuple[int, str]] = []
         self.system_devices: list[tuple[int, str]] = []
-        self.meeting_mode = tk.StringVar(value="offline")
+        self.meeting_mode = tk.StringVar(value=self.settings.get("mode", "offline"))
         self._cancel = threading.Event()
         self._transcribe_started = 0.0
         self.stage_count = 2
@@ -1156,15 +1231,53 @@ class MeetingApp(tk.Tk):
         self._sleep_asserted_at = 0.0
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
+        self._log_event(f"数据目录：{PATHS.data_dir}")
+        if recovered:
+            self._log_event(f"发现 {recovered} 个上次中断的任务，请到历史记录重试。")
+        for error in self.tasks.recovery_errors:
+            logging.warning("Task recovery failed: %s", error)
+            self._log_event(f"部分历史记录无法更新：{error}")
+        self._refresh_history()
+        self.after(50, self._drain_events)
         self.after(200, self._reload_devices)
         self.after(300, self._tick)
+        self.after(500, self.check_environment)
 
     def _build_ui(self) -> None:
-        frame = ttk.Frame(self, padding=20)
-        frame.pack(fill="both", expand=True)
-
-        ttk.Label(frame, text="会议录音与纪要", font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="音频和文字仅保存在本机；线上模式会同时保留麦克风、系统声音和完整混合录音。", foreground="#555").pack(anchor="w", pady=(4, 14))
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TButton", padding=(10, 7))
+        style.configure("TNotebook.Tab", padding=(20, 9))
+        style.configure("Treeview", rowheight=30)
+        outer = ttk.Frame(self, padding=18)
+        outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 12))
+        ttk.Label(header, text="会议录音中控台", font=("Microsoft YaHei UI", 22, "bold")).pack(side="left")
+        self.phase_label = ttk.Label(header, text="就绪", foreground="#24734b", font=("Microsoft YaHei UI", 12, "bold"))
+        self.phase_label.pack(side="right")
+        ttk.Label(outer, text="录音、转写与纪要留在本机 · 首次使用请先完成环境准备", foreground="#555").pack(anchor="w", pady=(0, 12))
+        self.tabs = ttk.Notebook(outer)
+        self.tabs.pack(fill="both", expand=True)
+        current = ttk.Frame(self.tabs, padding=14)
+        self.environment_tab = ttk.Frame(self.tabs, padding=18)
+        history = ttk.Frame(self.tabs, padding=18)
+        self.tabs.add(current, text="当前会议")
+        self.tabs.add(self.environment_tab, text="环境准备")
+        self.tabs.add(history, text="历史记录")
+        current.columnconfigure(0, weight=1, uniform="panels")
+        current.columnconfigure(1, weight=1, uniform="panels")
+        current.rowconfigure(0, weight=1)
+        frame = ttk.Frame(current, padding=(0, 0, 16, 0))
+        frame.grid(row=0, column=0, sticky="nsew")
+        preview_frame = ttk.Frame(current)
+        preview_frame.grid(row=0, column=1, sticky="nsew")
+        ttk.Label(preview_frame, text="实时文字 / 生成预览", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
+        self.preview = self._text_panel(preview_frame, height=15)
+        ttk.Label(preview_frame, text="运行事件", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(12, 8))
+        self.event_log = self._text_panel(preview_frame, height=6, expand=False)
+        self.elapsed_label = ttk.Label(preview_frame, text="任务耗时 00:00:00", foreground="#555")
+        self.elapsed_label.pack(anchor="w", pady=(8, 0))
 
         title_row = ttk.Frame(frame)
         title_row.pack(fill="x")
@@ -1199,7 +1312,8 @@ class MeetingApp(tk.Tk):
         self.device_box = ttk.Combobox(device_row, state="readonly", values=[])
         self.device_box.pack(side="left", fill="x", expand=True)
         self.device_box.bind("<<ComboboxSelected>>", lambda _event: self._restart_monitor())
-        ttk.Button(device_row, text="刷新", width=6, command=self._reload_devices).pack(side="left", padx=(6, 0))
+        self.refresh_devices_button = ttk.Button(device_row, text="刷新", width=6, command=self._reload_devices)
+        self.refresh_devices_button.pack(side="left", padx=(6, 0))
 
         system_row = ttk.Frame(frame)
         system_row.pack(fill="x", pady=(8, 0))
@@ -1224,7 +1338,7 @@ class MeetingApp(tk.Tk):
         self.system_level_text = ttk.Label(system_level_row, text="线下模式", width=12)
         self.system_level_text.pack(side="left", padx=(8, 0))
 
-        self.level_hint = ttk.Label(frame, text="正在检查麦克风……", foreground="#555", wraplength=600)
+        self.level_hint = ttk.Label(frame, text="正在检查麦克风……", foreground="#555", wraplength=440)
         self.level_hint.pack(anchor="w", pady=(6, 0))
 
         self.diarize_check = ttk.Checkbutton(
@@ -1257,9 +1371,249 @@ class MeetingApp(tk.Tk):
         self.status_label = ttk.Label(
             frame,
             text=f"准备就绪。转写：{WHISPER_MODEL}；纪要：{OLLAMA_MODEL}。请先确认所需电平条会动，再开始正式录音。",
-            wraplength=600,
+            wraplength=440,
         )
         self.status_label.pack(anchor="w", pady=(9, 0))
+        self._build_environment_ui()
+        self._build_history_ui(history)
+
+    @staticmethod
+    def _text_panel(parent, height: int, expand: bool = True):
+        box = ttk.Frame(parent)
+        box.pack(fill="both" if expand else "x", expand=expand)
+        text = tk.Text(box, height=height, wrap="word", state="disabled", relief="flat", padx=10, pady=10,
+                       font=("Microsoft YaHei UI", 10), background="#f5f7fa", foreground="#243246")
+        scrollbar = ttk.Scrollbar(box, command=text.yview)
+        text.config(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+        return text
+
+    def _append_text(self, widget, text: str) -> None:
+        widget.config(state="normal")
+        widget.insert("end", text)
+        # Limit preview memory for long meetings; complete text is preserved on disk.
+        if int(widget.index("end-1c").split(".")[0]) > 1500:
+            widget.delete("1.0", "300.0")
+        widget.see("end")
+        widget.config(state="disabled")
+
+    def _log_event(self, text: str) -> None:
+        self._append_text(self.event_log, f"{datetime.now():%H:%M:%S}  {text}\n")
+
+    def _set_status(self, text: str) -> None:
+        self.status_label.config(text=text)
+        self._log_event(text)
+
+    def _set_task_state(self, state: str, message: str = "", **fields) -> None:
+        self._task_state = state
+        labels = {"idle": "就绪", "recording": "录音中", "saving": "保存录音中", "transcribing": "转写中",
+                  "diarizing": "识别说话人", "summarizing": "生成纪要", "completed": "已完成",
+                  "failed": "需要处理", "cancelled": "已停止", "interrupted": "上次中断"}
+        self.phase_label.config(text=labels.get(state, state), foreground="#b06000" if state in {"failed", "interrupted"} else "#24734b")
+        if message:
+            self._set_status(message)
+        if self.meeting_dir is not None:
+            try:
+                self.tasks.update(self.meeting_dir, state=state, stage=state, message=message, **fields)
+            except (OSError, ValueError):
+                logging.exception("Cannot persist task state")
+                self._log_event("任务记录写入失败，请检查磁盘空间；录音状态请以原轨和录音日志为准。")
+        self._refresh_history()
+
+    def _build_environment_ui(self) -> None:
+        frame = self.environment_tab
+        ttk.Label(frame, text="使用前检查", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="录音可独立使用。转写模型首次下载约 1.6GB；纪要模型另需数 GB，准备完成后可离线处理。", wraplength=950).pack(anchor="w", pady=(8, 12))
+        self.environment_tree = ttk.Treeview(frame, columns=("name", "status", "detail"), show="headings", height=7)
+        for column, text, width in (("name", "组件", 145), ("status", "状态", 100), ("detail", "说明", 650)):
+            self.environment_tree.heading(column, text=text)
+            self.environment_tree.column(column, width=width, stretch=column == "detail")
+        self.environment_tree.pack(fill="x")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=12)
+        self.setup_buttons = []
+        for text, command in (("重新检查", self.check_environment), ("准备转写模型", lambda: self._prepare_environment("whisper")),
+                              ("准备说话人模型", lambda: self._prepare_environment("speakers")),
+                              ("准备纪要模型", lambda: self._prepare_environment("ollama")), ("启动 Ollama", self._launch_ollama)):
+            button = ttk.Button(row, text=text, command=command)
+            button.pack(side="left", padx=(0, 8))
+            self.setup_buttons.append(button)
+        self.setup_stop_button = ttk.Button(frame, text="停止准备", command=self._cancel_setup, state="disabled")
+        self.setup_stop_button.pack(anchor="w")
+        self.setup_status = ttk.Label(frame, text="正在检查本地环境……", wraplength=950)
+        self.setup_status.pack(anchor="w", pady=12)
+        ttk.Button(frame, text="下载 Ollama（打开官网）", command=lambda: webbrowser.open("https://ollama.com/download/windows")).pack(anchor="w")
+        ttk.Separator(frame).pack(fill="x", pady=18)
+        ttk.Label(frame, text=f"数据保存位置：{PATHS.data_dir}", wraplength=950).pack(anchor="w")
+        ttk.Button(frame, text="打开数据目录", command=lambda: os.startfile(PATHS.data_dir)).pack(anchor="w", pady=8)
+        ttk.Label(frame, text="旧版本录音不会移动；可在“当前会议 → 处理已有录音”中选择旧 WAV。", foreground="#555").pack(anchor="w")
+
+    def check_environment(self) -> None:
+        if self._checking_environment or self._closing:
+            return
+        self._checking_environment = True
+        self.setup_status.config(text="正在检查本地环境……")
+        microphone = bool(self.devices)
+        system_audio = any(is_system_audio_input(name) for _index, name in self.system_devices)
+
+        def inspect():
+            try:
+                ready, reason = ollama_ready()
+                free = shutil.disk_usage(OUTPUT_DIR).free / 1024 ** 3
+                rows = [
+                    ("麦克风", "可用" if microphone else "未发现", "请在当前会议页试音并确认电平跳动"),
+                    ("系统声音", "已发现" if system_audio else "待配置", "线上会议需要系统回放输入；线下会议不需要"),
+                    ("转写模型", "就绪" if whisper_ready(whisper_model_dir(PATHS)) else "未准备", WHISPER_MODEL),
+                    ("说话人模型", "就绪" if diarization_available() else "未准备", "可选；未准备时仍可录音和转写"),
+                    ("纪要服务", "就绪" if ready else "未就绪", reason or OLLAMA_MODEL),
+                    ("存储空间", f"{free:.1f} GB", str(OUTPUT_DIR)),
+                ]
+                self._post(self._environment_checked, rows, "检查完成。缺少模型时可使用上方按钮准备；录音文件始终独立保留。")
+            except Exception as error:
+                self._post(self._environment_checked, [], f"检查失败：{error}")
+        threading.Thread(target=inspect, daemon=True).start()
+
+    def _environment_checked(self, rows, message: str) -> None:
+        self._checking_environment = False
+        self.environment_tree.delete(*self.environment_tree.get_children())
+        for row in rows:
+            self.environment_tree.insert("", "end", values=row)
+        if not self._setup_busy:
+            self.setup_status.config(text=message)
+        available = diarization_available()
+        self.diarize_check.config(state="normal" if available and not self.processing else "disabled",
+                                  text="识别谁在说话（可选）" if available else "识别谁在说话（请先准备说话人模型）")
+
+    def _launch_ollama(self) -> None:
+        executable = shutil.which("ollama")
+        if not executable:
+            self.setup_status.config(text="未找到 Ollama。请使用下方“下载 Ollama”按钮安装，再重新检查。")
+            return
+        subprocess.Popen([executable, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.setup_status.config(text="已请求启动 Ollama，稍后重新检查。")
+        self.after(2000, self.check_environment)
+
+    def _prepare_environment(self, kind: str) -> None:
+        if self._setup_busy or self.processing or self.recorder is not None or self.saving:
+            self.setup_status.config(text="请先结束当前任务，再准备模型。")
+            return
+        self._setup_busy = True
+        self._setup_cancel.clear()
+        for button in self.setup_buttons:
+            button.config(state="disabled")
+        self.setup_stop_button.config(state="normal")
+        self.start_button.config(state="disabled")
+        self.existing_button.config(state="disabled")
+
+        def report(text):
+            self._post(self.setup_status.config, {"text": text})
+
+        def prepare():
+            try:
+                if kind == "whisper":
+                    prepare_whisper(whisper_model_dir(PATHS), report, self._setup_cancel.is_set)
+                elif kind == "speakers":
+                    from download_models import prepare_models
+                    prepare_models(MODELS_DIR, report, self._setup_cancel.is_set)
+                else:
+                    ollama_pull(OLLAMA_MODEL, report, self._setup_cancel.is_set)
+                message = "模型准备完成。"
+            except SetupCancelled:
+                message = "准备已停止；已完成的下载会保留。"
+            except Exception as error:
+                logging.exception("Environment setup failed")
+                message = f"准备失败：{error}。可重新点击准备按钮重试。"
+            self._post(self._environment_prepared, message)
+        threading.Thread(target=prepare, daemon=True).start()
+
+    def _cancel_setup(self) -> None:
+        self._setup_cancel.set()
+        self.setup_stop_button.config(state="disabled")
+        self.setup_status.config(text="正在停止。转写模型下载需等待当前下载返回；本地服务无响应时最多等待连接超时。")
+
+    def _environment_prepared(self, message: str) -> None:
+        self._setup_busy = False
+        if self._close_when_idle:
+            self._finish_close()
+            return
+        self.setup_stop_button.config(state="disabled")
+        for button in self.setup_buttons:
+            button.config(state="normal")
+        self.setup_status.config(text=message)
+        self._log_event(message)
+        self._restore_ready_controls()
+        self.check_environment()
+
+    def _build_history_ui(self, frame) -> None:
+        ttk.Label(frame, text="会议与处理记录", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w", pady=(0, 12))
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        self.history_tree = ttk.Treeview(table, columns=("title", "state", "updated"), show="headings", selectmode="browse")
+        for column, title, width in (("title", "会议名称", 380), ("state", "任务状态", 150), ("updated", "更新时间", 210)):
+            self.history_tree.heading(column, text=title)
+            self.history_tree.column(column, width=width)
+        scroll = ttk.Scrollbar(table, command=self.history_tree.yview)
+        self.history_tree.config(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.history_tree.pack(fill="both", expand=True)
+        self.history_tree.bind("<<TreeviewSelect>>", self._history_selected)
+        self.history_detail = ttk.Label(frame, text="选择一条记录查看结果或失败原因。", wraplength=950)
+        self.history_detail.pack(anchor="w", pady=12)
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        for text, command in (("刷新", self._refresh_history), ("打开文件夹", lambda: self._open_history_result(None)),
+                              ("查看逐字稿", lambda: self._open_history_result("逐字稿.txt")),
+                              ("查看纪要", lambda: self._open_history_result("会议纪要.md")), ("重新处理", self._retry_history)):
+            ttk.Button(row, text=text, command=command).pack(side="left", padx=(0, 8))
+
+    def _refresh_history(self) -> None:
+        selected = self.history_tree.selection()
+        self.history_tree.delete(*self.history_tree.get_children())
+        self._history = {}
+        labels = {"recording": "录音中", "saving": "保存中", "transcribing": "转写中", "diarizing": "识别说话人",
+                  "summarizing": "生成纪要", "completed": "已完成", "failed": "失败", "cancelled": "已停止", "interrupted": "意外中断"}
+        for task in self.tasks.history():
+            key = task["meeting_dir"]
+            self._history[key] = task
+            updated = datetime.fromisoformat(task["updated_at"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            self.history_tree.insert("", "end", iid=key, values=(task["title"], labels.get(task["state"], task["state"]), updated))
+        if selected and selected[0] in self._history:
+            self.history_tree.selection_set(selected[0])
+        if self.tasks.errors:
+            self.history_detail.config(text=f"有 {len(self.tasks.errors)} 条记录无法读取；其他记录仍可使用。")
+
+    def _selected_history(self):
+        selected = self.history_tree.selection()
+        return self._history.get(selected[0]) if selected else None
+
+    def _history_selected(self, _event=None) -> None:
+        task = self._selected_history()
+        if task:
+            self.history_detail.config(text=f"{task.get('message', '')}\n结果：{task['meeting_dir']}")
+
+    def _open_history_result(self, filename: str | None) -> None:
+        task = self._selected_history()
+        if not task:
+            return
+        path = Path(task["meeting_dir"])
+        if filename:
+            path /= filename
+        if not path.exists():
+            messagebox.showinfo("尚无结果", "该文件尚未生成或已经移动。请查看任务状态。")
+            return
+        os.startfile(path)
+
+    def _retry_history(self) -> None:
+        task = self._selected_history()
+        if not task or self.processing or self.recorder is not None or self.saving or self._setup_busy:
+            return
+        path = Path(task.get("audio_path") or "")
+        if not path.is_file():
+            messagebox.showinfo("找不到录音", "原录音不存在，请使用“处理已有录音”手动选择保留下来的音轨。")
+            return
+        self._process_existing_path(path, task["title"])
 
     def _selected_device(self) -> int | None:
         index = self.device_box.current()
@@ -1282,6 +1636,8 @@ class MeetingApp(tk.Tk):
         self._restart_monitor()
 
     def _reload_devices(self) -> None:
+        if self.recorder is not None or self.processing or self.saving or self._setup_busy:
+            return
         self._stop_monitor()
         if self.recorder is None:
             try:
@@ -1315,13 +1671,19 @@ class MeetingApp(tk.Tk):
         self.device_box.current(chosen)
         if self.system_devices:
             self.system_box.current(0)
+        for box, devices, key in ((self.device_box, self.devices, "microphone"), (self.system_box, self.system_devices, "system_audio")):
+            saved = self.settings.get(key)
+            for position, (_index, name) in enumerate(devices):
+                if name == saved:
+                    box.current(position)
+                    break
         self.system_box.config(state="readonly" if self._is_online() and self.system_devices else "disabled")
         if self.recorder is None:
             self._restart_monitor()
 
     def _restart_monitor(self) -> None:
         self._stop_monitor()
-        if self.recorder is not None:
+        if self.recorder is not None or self.processing or self.saving or self._setup_busy or self._closing:
             return
         device = self._selected_device()
         if device is None:
@@ -1408,6 +1770,8 @@ class MeetingApp(tk.Tk):
         label.config(text=f"{peak_to_dbfs(peak):.0f} dBFS" if peak >= SILENCE_PEAK else "静音")
 
     def _tick(self) -> None:
+        if self._closing:
+            return
         source = self.recorder or self.monitor
         self._show_level(source, self.level_bar, self.level_text)
         system_source = self.system_recorder or self.system_monitor
@@ -1421,6 +1785,8 @@ class MeetingApp(tk.Tk):
             self._update_recording_ui(self.recorder)
         elif self.monitor is not None:
             self._update_monitor_ui(self.monitor)
+        if self._task_started:
+            self.elapsed_label.config(text=f"任务耗时 {timestamp(time.monotonic() - self._task_started)}")
         self.after(200, self._tick)
 
     def _update_monitor_ui(self, monitor: Recorder) -> None:
@@ -1549,9 +1915,12 @@ class MeetingApp(tk.Tk):
         return None
 
     def start_recording(self) -> None:
+        if self.recorder is not None or self.processing or self.saving or self._setup_busy:
+            return
         recorder: Recorder | None = None
         system_recorder: Recorder | None = None
         system_device: int | None = None
+        task_created = False
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             free = shutil.disk_usage(OUTPUT_DIR).free
@@ -1564,7 +1933,7 @@ class MeetingApp(tk.Tk):
             ):
                 return
             self.meeting_title = safe_name(self.title_entry.get())
-            folder = f"{datetime.now():%Y%m%d-%H%M%S}-{self.meeting_title}"
+            folder = f"{datetime.now():%Y%m%d-%H%M%S-%f}-{self.meeting_title}"
             self.meeting_dir = OUTPUT_DIR / folder
             self.meeting_dir.mkdir(exist_ok=True)
             paths = meeting_audio_paths(self.meeting_dir, online)
@@ -1574,6 +1943,8 @@ class MeetingApp(tk.Tk):
             if primary_path is None or complete_path is None or backup_path is None:
                 raise RuntimeError("无法创建录音文件路径")
             self.audio_path = complete_path
+            self.tasks.create(self.meeting_title, complete_path, self.meeting_dir)
+            task_created = True
             device = self._selected_device()
             if device is None:
                 raise RuntimeError("没有选择麦克风")
@@ -1622,6 +1993,8 @@ class MeetingApp(tk.Tk):
                     pass
             self.recorder = None
             self.system_recorder = None
+            if task_created:
+                self._set_task_state("failed", f"无法开始录音：{error}")
             messagebox.showerror("无法开始录音", f"请确认麦克风和系统声音设备可用。\n\n{error}")
             self._restart_monitor()
             return
@@ -1633,6 +2006,17 @@ class MeetingApp(tk.Tk):
         self._system_silence_since = None
         self._silence_warned = False
         self._sleep_asserted_at = time.monotonic()
+        self._task_started = time.monotonic()
+        self.preview.config(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.config(state="disabled")
+        self.settings.update(mode=self.meeting_mode.get(), microphone=self.device_box.get(), system_audio=self.system_box.get())
+        try:
+            save_json(PATHS.config_path, self.settings)
+        except OSError:
+            logging.exception("Cannot save device preferences")
+            self._log_event("设备偏好保存失败，本次录音仍会继续。")
+        self._set_task_state("recording", "正在录音，原始音轨持续写入磁盘。")
         if not prevent_system_sleep(True):
             self.status_label.config(text="注意：系统拒绝了阻止睡眠的请求，请手动把电源计划设为“从不睡眠”。")
         else:
@@ -1646,6 +2030,7 @@ class MeetingApp(tk.Tk):
         self.system_box.config(state="disabled")
         self.offline_mode.config(state="disabled")
         self.online_mode.config(state="disabled")
+        self.refresh_devices_button.config(state="disabled")
 
     def stop_recording(self) -> None:
         if self.recorder is None or self.audio_path is None or self.meeting_dir is None:
@@ -1657,89 +2042,85 @@ class MeetingApp(tk.Tk):
         self.backup = None
         self.system_recorder = None
         self.stop_button.config(state="disabled")
+        self.saving = True
+        self._set_task_state("saving", "正在停止采集并保存音轨，请稍候……")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(12)
+        threading.Thread(target=self._finalize_recording, args=(recorder, backup, system), daemon=False).start()
+
+    def _finalize_recording(self, recorder: Recorder, backup: Recorder | None, system: Recorder | None) -> None:
+        """Drain and mix audio off the Tk thread; only the completion callback touches UI."""
         try:
             stop_recorders_safely(recorder, backup, system)
-        finally:
-            prevent_system_sleep(False)
-
-        self._write_recording_log(recorder, backup, system)
-        failures = recording_failures(recorder, backup, system)
-        if failures:
-            messagebox.showwarning(
-                "录音写入异常",
-                "以下音轨没有完整写入，请优先检查其他原轨和录音日志：\n\n" + "\n".join(failures),
-            )
+            self._write_recording_log(recorder, backup, system)
+            failures = recording_failures(recorder, backup, system)
             microphone_failed = recorder.error is not None and (backup is None or backup.error is not None)
             system_failed = system is not None and system.error is not None
             if microphone_failed or system_failed:
-                self.status_label.config(text="必要音轨写入失败，已停止自动处理；现有文件仍保留在结果目录。")
-                self._restore_ready_controls()
-                return
-        invalid: list[tuple[Recorder, str]] = []
-        for track in (recorder, backup, system):
-            if track is None or track.path is None:
-                continue
-            try:
-                verify_wav_file(track.path, track.expected_seconds)
-            except Exception as error:
-                invalid.append((track, f"{track.label}：{error}"))
-        chosen_mic_path = choose_microphone_recording(recorder, backup)
-        chosen_recorder = backup if backup is not None and chosen_mic_path == backup.path else recorder
-        # A short system track would be mixed against the full microphone track and shift
-        # every later remote sentence earlier, so it must block processing like the mic does.
-        if any(track is chosen_recorder or track is system for track, _message in invalid):
-            messagebox.showerror(
-                "录音不可用",
-                "必要音轨没有通过完整性校验，已停止自动处理。全部文件仍保留在结果目录，"
-                "可用“处理已有录音…”手动重试。\n\n" + "\n".join(message for _track, message in invalid),
-            )
-            self.status_label.config(text="必要音轨校验失败，已停止自动处理；现有文件仍保留在结果目录。")
-            self._restore_ready_controls()
-            return
-        if invalid:
-            messagebox.showwarning(
-                "录音文件校验失败",
-                "以下音轨可能不完整，请保留全部文件并查看录音日志：\n\n"
-                + "\n".join(message for _track, message in invalid),
-            )
-        if chosen_mic_path != recorder.path:
-            messagebox.showinfo(
-                "改用备份录音",
-                "麦克风备份比主录音更完整，将用备份轨生成完整录音；两份原轨都会保留。",
-            )
-        mic_peak = chosen_recorder.max_peak
-        chosen_path = chosen_mic_path
-        if system is not None:
-            self.status_label.config(text="原始音轨已保存，正在生成完整录音……")
-            self.update_idletasks()
-            try:
+                raise RuntimeError("必要音轨写入失败：\n" + "\n".join(failures))
+            invalid: list[tuple[Recorder, str]] = []
+            for track in (recorder, backup, system):
+                if track is None or track.path is None:
+                    continue
+                try:
+                    verify_wav_file(track.path, track.expected_seconds)
+                except Exception as error:
+                    invalid.append((track, f"{track.label}：{error}"))
+            chosen_mic_path = choose_microphone_recording(recorder, backup)
+            chosen_recorder = backup if backup is not None and chosen_mic_path == backup.path else recorder
+            if any(track is chosen_recorder or track is system for track, _message in invalid):
+                raise RuntimeError("必要音轨未通过完整性校验：\n" + "\n".join(message for _track, message in invalid))
+            warnings = failures + [message for _track, message in invalid]
+            if chosen_mic_path != recorder.path:
+                warnings.append("主录音不完整或无声，已改用麦克风备份轨；全部原轨仍保留。")
+            chosen_path = chosen_mic_path
+            if system is not None:
+                self._say("原始音轨已保存，正在合成完整录音……")
                 self._mix_complete_recording(chosen_recorder, chosen_mic_path, system)
                 chosen_path = self.audio_path
-            except Exception as error:
-                messagebox.showerror(
-                    "无法生成完整录音",
-                    f"麦克风和系统声音原轨仍已保留，但完整录音生成失败。\n\n{error}",
-                )
-                self._restore_ready_controls()
-                return
+            quiet = []
+            if chosen_recorder.max_peak < SILENCE_PEAK:
+                quiet.append("麦克风")
+            if system is not None and system.max_peak < SILENCE_PEAK:
+                quiet.append("电脑系统声音")
+            if recorder.overflowed:
+                warnings.append("录音期间检测到输入溢出，请重点检查音频。")
+            self._post(self._recording_saved, chosen_path, quiet, warnings, None)
+        except Exception as error:
+            logging.exception("Recording finalization failed")
+            self._post(self._recording_saved, recorder.path, [], [], str(error))
 
-        system_peak = system.max_peak if system is not None else SILENCE_PEAK
-        if mic_peak < SILENCE_PEAK or system_peak < SILENCE_PEAK:
-            self.status_label.config(text="有音频来源几乎无声，请先试听原始音轨。")
-            missing = []
-            if mic_peak < SILENCE_PEAK:
-                missing.append("麦克风")
-            if system is not None and system_peak < SILENCE_PEAK:
-                missing.append("电脑系统声音")
+    def _recording_saved(self, chosen_path, quiet, warnings, error: str | None) -> None:
+        self.saving = False
+        prevent_system_sleep(False)
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=0)
+        if error:
+            self._set_task_state("failed", f"录音收尾失败，全部原轨仍保留：{error}", audio_path=chosen_path)
+            self._task_started = 0.0
+            self._restore_ready_controls()
+            if self._close_when_idle:
+                self._finish_close()
+            else:
+                messagebox.showwarning("录音收尾未完成", f"请查看录音日志并试听原始音轨。\n\n{error}")
+            return
+        self.audio_path = chosen_path
+        if self._close_when_idle:
+            self._set_task_state("cancelled", "录音已保存；退出前未进行转写，可从历史记录重新处理。", audio_path=chosen_path)
+            self._finish_close()
+            return
+        if warnings:
+            self._log_event("；".join(warnings))
+            messagebox.showwarning("请检查录音", "\n".join(warnings))
+        if quiet:
             if not messagebox.askyesno(
                 "录音几乎没有声音",
-                f"{'、'.join(missing)}几乎没有声音。原始音轨已保留，请先试听检查。\n\n仍然要继续转写吗？",
+                f"{'、'.join(quiet)}几乎没有声音，原轨已保留。仍要继续转写吗？",
             ):
+                self._set_task_state("cancelled", "录音已保存，已停止自动处理。", audio_path=chosen_path)
+                self._task_started = 0.0
                 self._restore_ready_controls()
                 return
-
-        warning = "（录音期间检测到输入溢出，请重点检查音频）" if recorder.overflowed else ""
-        self.status_label.config(text=f"录音已保存{warning}。正在准备转写……")
         self._start_processing(self.meeting_dir, chosen_path, self.meeting_title)
 
     def _mix_complete_recording(self, microphone: Recorder, microphone_path: Path, system: Recorder) -> None:
@@ -1757,17 +2138,19 @@ class MeetingApp(tk.Tk):
         verify_wav_file(self.audio_path, expected)
 
     def _restore_ready_controls(self) -> None:
-        self.start_button.config(state="normal")
-        self.existing_button.config(state="normal")
+        self.start_button.config(state="normal" if self.devices and not self._setup_busy else "disabled")
+        self.existing_button.config(state="disabled" if self._setup_busy else "normal")
         self.title_entry.config(state="normal")
         self.device_box.config(state="readonly")
         self.system_box.config(state="readonly" if self._is_online() and self.system_devices else "disabled")
         self.offline_mode.config(state="normal")
         self.online_mode.config(state="normal")
+        self.refresh_devices_button.config(state="normal")
+        self.diarize_check.config(state="normal" if diarization_available() else "disabled")
         self._restart_monitor()
 
     def open_existing(self) -> None:
-        if self.recorder is not None or self.processing:
+        if self.recorder is not None or self.processing or self.saving or self._setup_busy:
             return
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         selected = filedialog.askopenfilename(
@@ -1778,20 +2161,34 @@ class MeetingApp(tk.Tk):
         if not selected:
             return
         audio_path = Path(selected)
-        meeting_dir = audio_path.parent
-        if (meeting_dir / "会议纪要.md").exists() and not messagebox.askyesno(
-            "已有纪要",
-            f"{meeting_dir.name} 里已经有会议纪要.md，重新处理会覆盖它和逐字稿.txt。\n\n继续吗？",
-        ):
+        title = safe_name(re.sub(r"^\d{8}-\d{6}-", "", audio_path.parent.name) or audio_path.stem)
+        self._process_existing_path(audio_path, title)
+
+    def _process_existing_path(self, audio_path: Path, title: str) -> None:
+        # Reprocessing creates a new result directory and never overwrites old results.
+        try:
+            task = self.tasks.create(title, audio_path=audio_path, state="transcribing")
+        except OSError as error:
+            messagebox.showerror("无法创建任务", str(error))
             return
-        title = safe_name(re.sub(r"^\d{8}-\d{6}-", "", meeting_dir.name) or audio_path.stem)
         self._stop_monitor()
-        self._start_processing(meeting_dir, audio_path, title)
+        self.tabs.select(0)
+        self._task_started = time.monotonic()
+        self.preview.config(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.config(state="disabled")
+        self._start_processing(Path(task["meeting_dir"]), audio_path, title)
 
     def _start_processing(self, meeting_dir: Path, audio_path: Path, title: str) -> None:
         self.meeting_dir = meeting_dir
         self.audio_path = audio_path
         self.meeting_title = title
+        if not whisper_ready(whisper_model_dir(PATHS)):
+            self._set_task_state("failed", "录音已保留。请先到“环境准备”下载转写模型，再从历史记录重新处理。", audio_path=audio_path)
+            self._task_started = 0.0
+            self._restore_ready_controls()
+            self.tabs.select(self.environment_tab)
+            return
         self.processing = True
         self._cancel.clear()
         self.diarize_now = bool(self.diarize_enabled.get()) and diarization_available()
@@ -1804,31 +2201,49 @@ class MeetingApp(tk.Tk):
         self.system_box.config(state="disabled")
         self.offline_mode.config(state="disabled")
         self.online_mode.config(state="disabled")
+        self.refresh_devices_button.config(state="disabled")
+        self.diarize_check.config(state="disabled")
         self.stop_button.config(text="停止处理", state="normal", command=self.cancel_processing)
         self.progress.config(mode="determinate", value=0)
-        threading.Thread(
+        self._set_task_state("transcribing", "录音已保存，正在准备转写……", audio_path=audio_path)
+        self._processing_thread = threading.Thread(
             target=self._process_meeting, args=(meeting_dir, audio_path, title), daemon=True
-        ).start()
+        )
+        self._processing_thread.start()
 
     def cancel_processing(self) -> None:
         if not self.processing or self._cancel.is_set():
             return
         if not messagebox.askyesno(
-            "停止处理", "已经转写出来的部分会保留在逐字稿.txt，剩下的需要以后重新处理。\n\n确定停止吗？"
+            "停止处理", "已生成的逐字稿会保留。正在运行的模型将在下个可取消位置停止；本地服务无响应时最多等待30秒。\n\n确定停止吗？"
         ):
             return
         self._cancel.set()
         self.stop_button.config(state="disabled")
-        self.status_label.config(text="正在停止，请等当前这一段转写完……")
+        self._set_status("正在停止，等待当前模型计算或网络读取返回；已生成的内容会保留。")
 
     def _post(self, callback, *args) -> None:
-        try:
-            self.after(0, callback, *args)
-        except Exception:
-            pass
+        if not self._closing:
+            self._events.put((callback, args))
+
+    def _drain_events(self) -> None:
+        if self._closing:
+            return
+        for _ in range(200):
+            try:
+                callback, args = self._events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args)
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+            if self._closing:
+                return
+        self.after(50, self._drain_events)
 
     def _say(self, text: str) -> None:
-        self._post(self.status_label.config, {"text": text})
+        self._post(self._set_status, text)
 
     def _show_progress(self, done: float, total: float, count: int) -> None:
         percent = min(100.0, done / total * 100) if total > 0 else 0.0
@@ -1847,6 +2262,8 @@ class MeetingApp(tk.Tk):
         self._post(self._show_progress, done, total, count)
 
     def _diarize_progress(self, processed: int, total: int, _arg=None) -> int:
+        if self._cancel.is_set():
+            return 1
         percent = processed / total * 100 if total else 0.0
         self._post(self._show_diarize_progress, percent)
         return 0
@@ -1904,7 +2321,10 @@ class MeetingApp(tk.Tk):
         boosted_path: Path | None = None
         diarize_copy = meeting_dir / "_分离副本.wav"
         stages = self.stage_count
+        model = None
+        segments = None
         try:
+            check_cancel(self._cancel)
             total_seconds, peak = wav_stats(audio_path)
             source_path = audio_path
             gain = 1.0
@@ -1915,10 +2335,12 @@ class MeetingApp(tk.Tk):
                 if gain > 1.0:
                     source_path = boosted_path
 
-            self._say(f"正在加载转写模型 {WHISPER_MODEL}（首次使用需要下载，请保持联网）……")
+            check_cancel(self._cancel)
+            self._say(f"正在加载本地转写模型 {WHISPER_MODEL}……")
             from faster_whisper import WhisperModel
 
-            model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            model = WhisperModel(str(whisper_model_dir(PATHS)), device="cpu", compute_type="int8", local_files_only=True)
+            check_cancel(self._cancel)
             segments, _ = model.transcribe(
                 str(source_path),
                 language="zh",
@@ -1959,6 +2381,7 @@ class MeetingApp(tk.Tk):
                             confidence_scores.append(segment.avg_logprob)
                             handle.write(line + "\n")
                             handle.flush()
+                            self._post(self._append_text, self.preview, line + "\n")
                     now = time.monotonic()
                     if now - last_report > 0.5:
                         last_report = now
@@ -1973,15 +2396,17 @@ class MeetingApp(tk.Tk):
             if cancelled:
                 notes.append("⚠ 本次转写被手动停止，以下只是录音的前一部分")
 
-            del segments
-            del model
+            segments = None
+            model = None
             gc.collect()
 
             speakers = 0
             if plain_lines and not cancelled and self.diarize_now:
+                check_cancel(self._cancel)
                 try:
-                    self._say(f"阶段 2/{stages} 正在识别谁在说话……")
+                    self._post(self._set_task_state, "diarizing", f"阶段 2/{stages} 正在识别谁在说话……")
                     turns = diarize(diarization_source(source_path, diarize_copy), progress=self._diarize_progress)
+                    check_cancel(self._cancel)
                     labels = label_speakers(spans, turns)
                     speakers = len({label for label in labels if label is not None})
                     if speakers >= 2:
@@ -1992,15 +2417,19 @@ class MeetingApp(tk.Tk):
                         notes.append(f"说话人分离：共 {speakers} 位（机器自动判断，可能有误）")
                     else:
                         notes.append("说话人分离：只听出一位说话人，未标注")
+                except ProcessingCancelled:
+                    raise
                 except Exception as error:
+                    check_cancel(self._cancel)
                     notes.append(f"说话人分离没有成功：{error}")
 
             transcript = "\n".join(timed_lines)
             transcript_path.write_text("\n".join(notes) + "\n\n" + transcript + "\n", encoding="utf-8")
 
             if cancelled:
-                self._post(self._processing_done, None, "已停止。逐字稿保留了已经转写出来的部分。")
+                self._post(self._processing_done, None, "已停止。逐字稿保留了已经转写出来的部分。", True)
                 return
+            check_cancel(self._cancel)
             if not plain_lines:
                 raise RuntimeError("没有识别到有效语音，请试听原始录音并查看录音日志.txt")
 
@@ -2015,22 +2444,27 @@ class MeetingApp(tk.Tk):
                         audio_path,
                         quality,
                         speakers,
-                        lambda index, count: self._say(
-                            f"阶段 {stages}/{stages} 正在生成会议纪要：第 {index}/{count} 步……"
-                        ),
+                        lambda index, count: self._post(self._minutes_progress, index, count),
+                        cancel=self._cancel,
+                        on_text=lambda text: self._post(self._append_text, self.preview, text),
                     )
                     reason = ""
+                except ProcessingCancelled:
+                    raise
                 except Exception as error:
+                    check_cancel(self._cancel)
                     reason = str(error)
                     minutes = fallback_minutes("\n".join(plain_lines), title, audio_path)
-                finally:
-                    stop_ollama_model(OLLAMA_MODEL)
             else:
                 minutes = fallback_minutes("\n".join(plain_lines), title, audio_path)
+            check_cancel(self._cancel)
             (meeting_dir / "会议纪要.md").write_text(minutes, encoding="utf-8")
             done_note = f"会议纪要是简易兜底版：{reason}" if reason else ""
             self._post(self._processing_done, None, done_note)
+        except ProcessingCancelled:
+            self._post(self._processing_done, None, "已停止。原录音与已生成的逐字稿已保留，可从历史记录重新处理。", True)
         except Exception as error:
+            logging.exception("Meeting processing failed")
             try:
                 (meeting_dir / "处理失败说明.txt").write_text(
                     f"原始录音已安全保存：{audio_path}\n处理失败：{error}\n",
@@ -2040,6 +2474,8 @@ class MeetingApp(tk.Tk):
                 pass
             self._post(self._processing_done, str(error), "")
         finally:
+            del segments, model
+            gc.collect()
             for temporary in (boosted_path, diarize_copy):
                 if temporary is not None:
                     try:
@@ -2048,14 +2484,28 @@ class MeetingApp(tk.Tk):
                         pass
 
     def _begin_minutes_phase(self) -> None:
+        self._set_task_state("summarizing", "正在生成会议纪要；下方预览将随模型输出更新。")
         self.progress.config(mode="indeterminate")
         self.progress.start(12)
 
-    def _processing_done(self, error: str | None, note: str = "") -> None:
+    def _minutes_progress(self, index: int, count: int) -> None:
+        self._set_status(f"正在生成会议纪要：第 {index}/{count} 步……")
+        self._append_text(self.preview, f"\n\n—— 纪要生成 {index}/{count} ——\n")
+
+    def _processing_done(self, error: str | None, note: str = "", cancelled: bool = False) -> None:
+        cancelled = cancelled or self._cancel.is_set()
+        if cancelled and not note:
+            note = "已停止；停止请求到达前已写入的结果仍保留，可从历史记录查看。"
         self.processing = False
         self._cancel.clear()
         self.progress.stop()
         self.progress.config(mode="determinate", value=0)
+        message = f"原始录音已保存，但自动处理失败：{error}" if error else (note or "完成：原始录音、逐字稿和会议纪要均已保存。")
+        self._set_task_state("failed" if error else "cancelled" if cancelled else "completed", message)
+        self._task_started = 0.0
+        if self._close_when_idle:
+            self._finish_close()
+            return
         self._restore_ready_controls()
         self.stop_button.config(text="结束并生成纪要", command=self.stop_recording, state="disabled")
         if error:
@@ -2074,39 +2524,18 @@ class MeetingApp(tk.Tk):
         subprocess.Popen(["explorer.exe", str(target)])
 
     def on_close(self) -> None:
+        if self._close_when_idle:
+            return
         if self.recorder is not None:
-            if not messagebox.askyesno("正在录音", "关闭程序会立即停止录音。确定关闭吗？"):
+            if not messagebox.askyesno("正在录音", "将停止录音、保存并校验原轨后退出。确定关闭吗？"):
                 return
-            recorder = self.recorder
-            backup = self.backup
-            system = self.system_recorder
-            self.recorder = None
-            self.backup = None
-            self.system_recorder = None
-            try:
-                stop_errors = stop_recorders_safely(recorder, backup, system)
-                self._write_recording_log(recorder, backup, system)
-                if stop_errors:
-                    messagebox.showwarning(
-                        "录音收尾异常",
-                        "所有音轨均已尝试停止，但部分文件可能不完整：\n\n" + "\n".join(stop_errors),
-                    )
-                if (
-                    system is not None
-                    and system.error is None
-                    and system.path is not None
-                    and self.audio_path is not None
-                ):
-                    mic_path = choose_microphone_recording(recorder, backup)
-                    chosen_recorder = backup if backup is not None and mic_path == backup.path else recorder
-                    self._mix_complete_recording(chosen_recorder, mic_path, system)
-            except Exception as error:
-                messagebox.showwarning(
-                    "录音收尾未完成",
-                    f"已尽力保留所有原始音轨，但关闭时的最终校验或合成失败。\n\n{error}",
-                )
-            finally:
-                prevent_system_sleep(False)
+            self._close_when_idle = True
+            self.stop_recording()
+            return
+        elif self.saving:
+            self._close_when_idle = True
+            self._set_status("正在保存，完成校验后会自动退出，请勿强制结束程序。")
+            return
         elif self.processing:
             if not messagebox.askyesno(
                 "正在处理",
@@ -2115,12 +2544,85 @@ class MeetingApp(tk.Tk):
             ):
                 return
             self._cancel.set()
+            self._close_when_idle = True
+            self.stop_button.config(state="disabled")
+            self._set_status("正在停止当前模型任务，停止并保存已有结果后自动退出……")
+            return
+        elif self._setup_busy:
+            self._setup_cancel.set()
+            self._close_when_idle = True
+            self._cancel_setup()
+            return
+        self._finish_close()
+
+    def _finish_close(self) -> None:
         self._stop_monitor()
+        self._closing = True
+        prevent_system_sleep(False)
         self.destroy()
+
+    def report_callback_exception(self, exc, value, traceback) -> None:
+        logging.error("UI callback failed", exc_info=(exc, value, traceback))
+        messagebox.showerror("操作未完成", f"{value}\n\n详情已保存到数据目录的 logs 文件夹。")
+
+
+def main() -> None:
+    handler = RotatingFileHandler(PATHS.logs_dir / "app.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, handlers=[handler], format="%(asctime)s %(levelname)s %(message)s")
+    if "--diagnostics-file" in sys.argv:
+        import importlib
+        modules = {}
+        for name in ("sounddevice", "numpy", "faster_whisper", "ctranslate2", "sherpa_onnx", "onnxruntime"):
+            try:
+                module = importlib.import_module(name)
+                modules[name] = str(getattr(module, "__version__", "imported"))
+            except Exception as error:
+                modules[name] = f"ERROR: {error}"
+        result = {"data_dir": str(PATHS.data_dir), "output_dir": str(OUTPUT_DIR), "models_dir": str(MODELS_DIR),
+                  "resource_dir": str(PATHS.resource_dir), "frozen": bool(getattr(sys, "frozen", False)), "modules": modules}
+        try:
+            from faster_whisper.audio import decode_audio
+            with tempfile.TemporaryDirectory() as temporary:
+                sample = Path(temporary) / "decoder-check.wav"
+                with wave.open(str(sample), "wb") as writer:
+                    writer.setnchannels(1)
+                    writer.setsampwidth(2)
+                    writer.setframerate(16000)
+                    writer.writeframes(b"\x00\x10" * 1600)
+                result["audio_decode_frames"] = len(decode_audio(str(sample), sampling_rate=16000))
+            result["tcl_version"] = tk.Tcl().eval("info patchlevel")
+        except Exception as error:
+            result["runtime_error"] = str(error)
+        filename = sys.argv[sys.argv.index("--diagnostics-file") + 1]
+        save_json(Path(filename), result)
+        return
+
+    # Prevent two consoles from recording simultaneously or recovering each other's tasks.
+    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    _kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _kernel32.CloseHandle.restype = ctypes.c_int
+    name = "Local\\MeetingRecord-" + hashlib.sha256(str(PATHS.data_dir).casefold().encode()).hexdigest()[:24]
+    handle = _kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        raise ctypes.WinError()
+    if _kernel32.GetLastError() == 183:
+        _kernel32.CloseHandle(handle)
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("程序已在运行", "会议录音中控台已经打开，请使用现有窗口。", parent=root)
+        root.destroy()
+        return
+    try:
+        console = MeetingApp()
+        console.mainloop()
+    except Exception as error:
+        logging.exception("Application startup failed")
+        messagebox.showerror("启动失败", f"{error}\n\n日志：{PATHS.logs_dir}")
+    finally:
+        _kernel32.CloseHandle(handle)
+        handler.close()
 
 
 if __name__ == "__main__":
-    app = MeetingApp()
-    if "--autostart" in sys.argv:
-        app.after(1_500, app.start_recording)
-    app.mainloop()
+    main()
