@@ -3,6 +3,7 @@ import queue
 import threading
 import tempfile
 import wave
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
@@ -12,6 +13,43 @@ import app
 
 
 class OllamaStreamingTest(unittest.TestCase):
+    def test_cold_start_first_token_can_take_more_than_thirty_seconds(self):
+        # Scale socket timeouts so a real delayed HTTP response tests a >30s
+        # cold start without making the regression suite wait that long.
+        class DelayedOllama(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.flush()
+                threading.Event().wait(0.25)
+                try:
+                    self.wfile.write(b'{"response":"AI minutes","done":true}\n')
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_args):
+                pass
+
+        with HTTPServer(("127.0.0.1", 0), DelayedOllama) as server:
+            thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+            thread.start()
+            real_urlopen = app.request.urlopen
+
+            def local_service(req, *, timeout):
+                redirected = app.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/api/generate",
+                    data=req.data, headers=dict(req.header_items()), method="POST",
+                )
+                return real_urlopen(redirected, timeout=timeout / 200)
+
+            try:
+                with mock.patch("app.request.urlopen", side_effect=local_service):
+                    self.assertEqual(app.run_ollama("long meeting"), "AI minutes")
+            finally:
+                server.shutdown()
+                thread.join(timeout=2)
+
     def response(self, *items):
         response = mock.MagicMock()
         response.__enter__.return_value = response
@@ -132,6 +170,56 @@ class ConsoleDispatchTest(unittest.TestCase):
 
 
 class ProcessingLifecycleTest(unittest.TestCase):
+    def test_interrupted_online_recording_can_retry_raw_track_before_mix_exists(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            tasks = app.TaskStore(root)
+            target = SimpleNamespace(
+                recorder=None, processing=False, saving=False, _setup_busy=False,
+                tasks=tasks, settings={}, meeting_mode=mock.Mock(), preview=mock.Mock(),
+                _is_online=lambda: True, _selected_device=lambda: 1,
+                _selected_system_device=lambda: 2, _take_preroll=lambda **_: (b"", 0.0),
+                _start_backup=mock.Mock(return_value=None), _set_task_state=mock.Mock(),
+                _restart_monitor=mock.Mock(), _log_event=mock.Mock(),
+            )
+            for name in ("title_entry", "status_label", "start_button", "existing_button", "stop_button",
+                         "device_box", "system_box", "offline_mode", "online_mode", "refresh_devices_button"):
+                setattr(target, name, mock.Mock())
+            target.title_entry.get.return_value = "online meeting"
+
+            def recorder(path, **_kwargs):
+                def write_raw_audio():
+                    with wave.open(str(path), "wb") as writer:
+                        writer.setnchannels(1)
+                        writer.setsampwidth(2)
+                        writer.setframerate(16000)
+                        writer.writeframes(b"\x00\x10" * 1600)
+                return SimpleNamespace(path=path, start=write_raw_audio)
+
+            with (
+                mock.patch("app.OUTPUT_DIR", root),
+                mock.patch("app.Recorder", side_effect=recorder),
+                mock.patch("app.input_capture_settings", return_value=(16000, 1, None)),
+                mock.patch("app.shutil.disk_usage", return_value=SimpleNamespace(free=10 * 1024**3)),
+                mock.patch("app.save_json"),
+                mock.patch("app.prevent_system_sleep", return_value=True),
+            ):
+                app.MeetingApp.start_recording(target)
+
+            restarted = app.TaskStore(root)
+            self.assertEqual(restarted.recover_interrupted(), 1)
+            recovered = restarted.history()[0]
+            self.assertEqual(recovered["state"], "interrupted")
+            self.assertEqual(Path(recovered["audio_path"]), target.recorder.path)
+            self.assertTrue(Path(recovered["audio_path"]).is_file())
+            self.assertFalse(target.audio_path.exists(), "Mixed output must still be absent before finalization")
+            raw_path = target.recorder.path
+            target.recorder = None
+            target._selected_history = lambda: recovered
+            target._process_existing_path = mock.Mock()
+            app.MeetingApp._retry_history(target)
+            target._process_existing_path.assert_called_once_with(raw_path, "online meeting")
+
     def test_installed_audio_decoder_can_read_pcm_wave(self):
         # Use the real native decoder: import-only smoke tests missed PyAV 19's API break.
         from faster_whisper.audio import decode_audio

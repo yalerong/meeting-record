@@ -27,7 +27,7 @@ result directory rather than overwriting previous results.
 ## Evidence
 
 - Original regression suite: 65 tests passed before changes to `app.py`.
-- Final `python -X utf8 -m unittest discover -q`: **112 tests passed**, no skips.
+- Final `python -X utf8 -m unittest discover -q`: **114 tests passed**, no skips.
 - `ruff check --isolated --select E4,E7,E9,F .`: passed.
 - Python compilation, `pip check`, and `git diff --check`: passed.
 - Real EXE tests: Windows GUI subsystem; PortAudio relative DLL path; Whisper VAD;
@@ -44,6 +44,10 @@ result directory rather than overwriting previous results.
   `.omx/state/control-console/ralph-progress.json` (local, ignored by Git).
 - Existing local Whisper cache was reused in the persistent model directory;
   optional speaker models were downloaded there. No model weights are distributed.
+- PR review regressions: a real delayed local HTTP stream (with scaled timeouts)
+  verifies a healthy CPU cold start beyond 30 seconds is accepted. An online
+  recording interrupted before mixing retains an existing raw track and can be
+  retried directly from recovered history.
 
 ## Remaining limits
 
@@ -52,7 +56,8 @@ result directory rather than overwriting previous results.
 - No clean Windows VM, extended hardware microphone/loopback recording, unplugging
   devices during a real meeting, or multi-hour recording was tested in this run.
 - Whisper computation stops at segment boundaries; native diarization stops at
-  callbacks; Ollama cancellation waits for output or the 30-second read timeout.
+  callbacks; Ollama cancellation waits for output or the 600-second read timeout,
+  allowing CPU model loading and long-prompt evaluation before the first token.
   The upstream Whisper downloader can only cancel after its current call returns.
 - The portable EXE needs its neighboring `_internal` directory. New computers
   still need model preparation and Ollama for AI minutes; recording is independent.

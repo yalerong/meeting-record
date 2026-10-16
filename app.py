@@ -536,8 +536,10 @@ def run_ollama(
         # api_request always targets the fixed loopback-only URL above.
         pieces = []
         done = False
-        # A stalled local service must not leave cancellation waiting for ten minutes.
-        with request.urlopen(api_request, timeout=30) as response:  # nosec B310
+        # CPU model loading and long-prompt evaluation may take minutes before
+        # the first token. Keep that wait distinct from checking cancellation
+        # between streamed events.
+        with request.urlopen(api_request, timeout=600) as response:  # nosec B310
             for raw in response:
                 check_cancel(cancel)
                 if not raw.strip():
@@ -1943,7 +1945,9 @@ class MeetingApp(tk.Tk):
             if primary_path is None or complete_path is None or backup_path is None:
                 raise RuntimeError("无法创建录音文件路径")
             self.audio_path = complete_path
-            self.tasks.create(self.meeting_title, complete_path, self.meeting_dir)
+            # The mixed output does not exist until finalization. Keep a raw
+            # track recoverable in history if recording is interrupted first.
+            self.tasks.create(self.meeting_title, primary_path, self.meeting_dir)
             task_created = True
             device = self._selected_device()
             if device is None:
@@ -2215,7 +2219,7 @@ class MeetingApp(tk.Tk):
         if not self.processing or self._cancel.is_set():
             return
         if not messagebox.askyesno(
-            "停止处理", "已生成的逐字稿会保留。正在运行的模型将在下个可取消位置停止；本地服务无响应时最多等待30秒。\n\n确定停止吗？"
+            "停止处理", "已生成的逐字稿会保留。正在运行的模型将在下个可取消位置停止；纪要模型冷启动或处理长文本时可能需要等待，本地服务读取超时上限为10分钟。\n\n确定停止吗？"
         ):
             return
         self._cancel.set()
