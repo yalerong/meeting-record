@@ -1,6 +1,7 @@
 import struct
 import math
 import tempfile
+import threading
 import unittest
 import wave
 from collections.abc import Sequence
@@ -208,6 +209,32 @@ class WavWriterTest(unittest.TestCase):
                     SimpleNamespace(input_overflow=False),
                 )
             self.assertAlmostEqual(recorder.live_started_at, 499.8)
+
+    def test_preroll_handoff_after_an_idle_tail_keeps_the_audio_timeline(self):
+        # stop() pads an idle tail with silence. The preroll handed to the next recorder
+        # then ends at stop time, so the new track must be dated from its first real sample.
+        monitor = Recorder(None, samplerate=10, keep_preroll=True)
+        monitor._consumer = threading.Thread(target=monitor._consume, daemon=True)
+        monitor._consumer.start()
+        status = SimpleNamespace(input_overflow=False)
+        with mock.patch("app.time.monotonic", return_value=100.2):
+            monitor._callback(bytearray(struct.pack("<2h", 100, 200)), 2, None, status)
+        with mock.patch("app.time.monotonic", return_value=103.4):
+            monitor.stop()
+
+        preroll = monitor.preroll_bytes()
+        self.assertAlmostEqual(len(preroll) / 2 / 10, 3.4)  # 2 captured samples + 3.2 s padding
+        recorder = Recorder(
+            None, samplerate=10, preroll=preroll, preroll_ended_at=monitor.last_capture_ended_at,
+        )
+        recorder.preroll_seconds = len(preroll) / 2 / 10
+        with mock.patch("app.time.monotonic", return_value=103.8):
+            recorder._callback(bytearray(struct.pack("<2h", 7, 7)), 2, None, status)
+
+        # The first real preroll sample was captured at 100.0, and the 0.2 s after stop
+        # is the only interval that still needs padding.
+        self.assertAlmostEqual(recorder.audio_started_at, 100.0)
+        self.assertEqual(list(recorder._queue.queue), [bytes(2 * 2), struct.pack("<2h", 7, 7)])
 
     def test_stop_pads_a_trailing_capture_gap(self):
         # A loopback endpoint stops calling back when nothing plays; the tail must still

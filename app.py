@@ -994,6 +994,10 @@ class Recorder:
                 self._queue.put(bytes(gap_frames * SAMPLE_WIDTH))
                 self.padded_seconds += gap_frames / self.samplerate
                 self._note(f"[{timestamp(self.recorded_seconds)}] 结束前约 {gap:.1f} 秒没有采到数据，已用静音补齐")
+                # The queued audio (this monitor's preroll) now ends at stop time, not at the
+                # last captured block. Handing the older boundary to the next recorder would
+                # date the padded preroll earlier than it was captured and shift the track.
+                self.last_capture_ended_at = self.stopped_at
         self._queue.put(None)
         if self._consumer is not None:
             self._consumer.join(timeout=15)
@@ -1824,7 +1828,10 @@ class MeetingApp(tk.Tk):
             self._sleep_asserted_at = now
 
         self.timer_label.config(text=timestamp(recorder.recorded_seconds))
-        drift = (now - recorder.started_at) - recorder.recorded_seconds
+        # recorded_seconds counts the preroll (audio captured before start()) and any
+        # padded gaps. Compare only the live session against wall time, otherwise the
+        # 30-second preroll hides up to 30 seconds of lost capture.
+        drift = (now - recorder.started_at) - (recorder.recorded_seconds - recorder.preroll_seconds)
 
         if recorder.level_peak >= SILENCE_PEAK:
             self._silence_since = None
@@ -2054,6 +2061,9 @@ class MeetingApp(tk.Tk):
 
     def _finalize_recording(self, recorder: Recorder, backup: Recorder | None, system: Recorder | None) -> None:
         """Drain and mix audio off the Tk thread; only the completion callback touches UI."""
+        # If finalization fails after the backup has been selected, retry must open the
+        # track that actually carries sound, not the silent primary one.
+        chosen_path = recorder.path
         try:
             stop_recorders_safely(recorder, backup, system)
             self._write_recording_log(recorder, backup, system)
@@ -2092,7 +2102,7 @@ class MeetingApp(tk.Tk):
             self._post(self._recording_saved, chosen_path, quiet, warnings, None)
         except Exception as error:
             logging.exception("Recording finalization failed")
-            self._post(self._recording_saved, recorder.path, [], [], str(error))
+            self._post(self._recording_saved, chosen_path, [], [], str(error))
 
     def _recording_saved(self, chosen_path, quiet, warnings, error: str | None) -> None:
         self.saving = False
@@ -2165,7 +2175,8 @@ class MeetingApp(tk.Tk):
         if not selected:
             return
         audio_path = Path(selected)
-        title = safe_name(re.sub(r"^\d{8}-\d{6}-", "", audio_path.parent.name) or audio_path.stem)
+        # Task folders are named ``%Y%m%d-%H%M%S-%f-title``; strip the whole timestamp.
+        title = safe_name(re.sub(r"^\d{8}-\d{6}-\d{6}-", "", audio_path.parent.name) or audio_path.stem)
         self._process_existing_path(audio_path, title)
 
     def _process_existing_path(self, audio_path: Path, title: str) -> None:

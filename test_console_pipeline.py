@@ -168,6 +168,41 @@ class ConsoleDispatchTest(unittest.TestCase):
         verify.assert_not_called()
         self.assertIn("disk full", target._post.call_args.args[-1])
 
+    def test_failed_mixing_reports_the_track_that_carries_sound(self):
+        # A silent primary must not become the retry path when the audible backup was
+        # already selected and only the final mix failed.
+        primary = mock.Mock(path=Path("primary.wav"), error=None, max_peak=31,
+                            recorded_seconds=5.0, expected_seconds=5.0, overflowed=False)
+        backup = mock.Mock(path=Path("backup.wav"), error=None, max_peak=2_000,
+                           recorded_seconds=60.0, expected_seconds=60.0, overflowed=False)
+        system = mock.Mock(path=Path("system.wav"), error=None, max_peak=2_000,
+                           recorded_seconds=60.0, expected_seconds=60.0, overflowed=False)
+        target = SimpleNamespace(
+            _write_recording_log=mock.Mock(), _post=mock.Mock(), _recording_saved=mock.Mock(),
+            _say=mock.Mock(), audio_path=Path("complete.wav"),
+            _mix_complete_recording=mock.Mock(side_effect=RuntimeError("mix failed")),
+        )
+        with mock.patch("app.verify_wav_file"), mock.patch("app.logging.exception"):
+            app.MeetingApp._finalize_recording(target, primary, backup, system)
+        self.assertEqual(target._post.call_args.args[1], backup.path)
+        self.assertIn("mix failed", target._post.call_args.args[-1])
+
+    def test_lost_capture_is_visible_even_with_preroll(self):
+        # recorded_seconds includes the preroll, so comparing it with wall time directly
+        # would hide the first 30 seconds of unpadded data loss.
+        target = SimpleNamespace(
+            timer_label=mock.Mock(), level_hint=mock.Mock(), system_recorder=None,
+            _silence_since=None, _system_silence_since=None, _silence_warned=False,
+            _sleep_asserted_at=1_000.0, _backup_note=lambda: "；无备份路",
+        )
+        recorder = SimpleNamespace(
+            recorded_seconds=110.0, preroll_seconds=30.0, started_at=900.0,
+            level_peak=1_000, error=None, idle_seconds=0.0, restarts=0,
+        )
+        with mock.patch("app.time.monotonic", return_value=1_000.0):
+            app.MeetingApp._update_recording_ui(target, recorder)
+        self.assertIn("落后墙上时间 20 秒", target.level_hint.config.call_args.kwargs["text"])
+
 
 class ProcessingLifecycleTest(unittest.TestCase):
     def test_interrupted_online_recording_can_retry_raw_track_before_mix_exists(self):
@@ -219,6 +254,16 @@ class ProcessingLifecycleTest(unittest.TestCase):
             target._process_existing_path = mock.Mock()
             app.MeetingApp._retry_history(target)
             target._process_existing_path.assert_called_once_with(raw_path, "online meeting")
+
+    def test_existing_recording_title_drops_the_whole_folder_timestamp(self):
+        audio = Path("meetings") / "20261016-130508-123456-周会" / "原始录音.wav"
+        target = SimpleNamespace(recorder=None, processing=False, saving=False, _setup_busy=False)
+        with (
+            mock.patch("app.filedialog.askopenfilename", return_value=str(audio)),
+            mock.patch.object(target, "_process_existing_path", create=True) as process,
+        ):
+            app.MeetingApp.open_existing(target)
+        process.assert_called_once_with(audio, "周会")
 
     def test_installed_audio_decoder_can_read_pcm_wave(self):
         # Use the real native decoder: import-only smoke tests missed PyAV 19's API break.
